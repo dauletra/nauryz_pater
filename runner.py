@@ -72,9 +72,11 @@ def run_region(region_guid: str, region_name: str) -> dict:
             logger.info("[%s] Уведомляю %d подписчиков", region_name, len(subscribers))
             for user_id in subscribers:
                 if new_objects:
-                    notifier.send_new_listings(new_objects, chat_id=str(user_id))
+                    notifier.send_new_listings(new_objects, chat_id=str(user_id),
+                                               region_guid=region_guid)
                 if changed_objects:
-                    notifier.send_changed_listings(changed_objects, chat_id=str(user_id))
+                    notifier.send_changed_listings(changed_objects, chat_id=str(user_id),
+                                                   region_guid=region_guid)
 
     return {
         "new":     len(new_objects),

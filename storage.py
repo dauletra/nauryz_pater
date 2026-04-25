@@ -101,6 +101,16 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (region_guid, date)
         );
 
+        CREATE TABLE IF NOT EXISTS payments (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id             INTEGER NOT NULL REFERENCES users(user_id),
+            region_guid         TEXT NOT NULL,
+            stars_amount        INTEGER NOT NULL,
+            telegram_charge_id  TEXT,
+            invoice_payload     TEXT,
+            paid_at             TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        );
+
         CREATE INDEX IF NOT EXISTS idx_snapshots_inner_code
             ON object_snapshots(inner_code);
         CREATE INDEX IF NOT EXISTS idx_subscriptions_region
@@ -111,6 +121,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             ON subscriptions(region_guid, paid_until);
         CREATE INDEX IF NOT EXISTS idx_subscriptions_expiring
             ON subscriptions(paid_until);
+        CREATE INDEX IF NOT EXISTS idx_payments_user
+            ON payments(user_id, paid_at);
     """)
     conn.commit()
 
@@ -157,6 +169,13 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         """)
         conn.commit()
         logger.info("Миграция object_snapshots завершена")
+
+    # Миграция 2: subscriptions.cancelled_at
+    sub_cols = {row[1] for row in conn.execute("PRAGMA table_info(subscriptions)").fetchall()}
+    if "cancelled_at" not in sub_cols:
+        conn.execute("ALTER TABLE subscriptions ADD COLUMN cancelled_at TEXT")
+        conn.commit()
+        logger.info("Миграция: добавлена колонка subscriptions.cancelled_at")
 
 
 # ---------------------------------------------------------------------------
@@ -254,27 +273,43 @@ def activate_subscription(user_id: int, region_guid: str, days: int = 30) -> str
         """INSERT INTO subscriptions (user_id, region_guid, paid_until)
            VALUES (?, ?, ?)
            ON CONFLICT(user_id, region_guid) DO UPDATE SET
-               paid_until = excluded.paid_until""",
+               paid_until   = excluded.paid_until,
+               cancelled_at = NULL""",
         (user_id, region_guid, paid_until),
     )
     _db().commit()
     return paid_until
 
 
-def deactivate_subscription(user_id: int, region_guid: str) -> None:
-    _db().execute(
-        "DELETE FROM subscriptions WHERE user_id = ? AND region_guid = ?",
-        (user_id, region_guid),
-    )
+def deactivate_subscription(user_id: int, region_guid: str,
+                             immediate: bool = True) -> None:
+    """Отписать пользователя.
+
+    immediate=True  — удалить запись, уведомления прекращаются немедленно.
+    immediate=False — мягкая отмена: уведомления продолжаются до paid_until,
+                      запись остаётся для истории и повторной подписки.
+    """
+    if immediate:
+        _db().execute(
+            "DELETE FROM subscriptions WHERE user_id = ? AND region_guid = ?",
+            (user_id, region_guid),
+        )
+    else:
+        _db().execute(
+            """UPDATE subscriptions
+               SET cancelled_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+               WHERE user_id = ? AND region_guid = ?""",
+            (user_id, region_guid),
+        )
     _db().commit()
 
 
 def get_user_subscriptions(user_id: int) -> list[dict]:
-    """Только активные подписки пользователя."""
+    """Подписки пользователя с действующим сроком (активные и мягко отменённые)."""
     rows = _db().execute(
-        """SELECT region_guid, paid_until FROM subscriptions
+        """SELECT region_guid, paid_until, cancelled_at FROM subscriptions
            WHERE user_id = ? AND paid_until > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-           ORDER BY region_guid""",
+           ORDER BY cancelled_at NULLS FIRST, region_guid""",
         (user_id,),
     ).fetchall()
     return [dict(r) for r in rows]
@@ -306,6 +341,113 @@ def get_active_subscriptions_count() -> int:
            WHERE paid_until > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"""
     ).fetchone()
     return row["cnt"] if row else 0
+
+
+def cleanup_expired_subscriptions(days: int = 90) -> int:
+    """Удалить из subscriptions записи, истёкшие более days дней назад.
+
+    История покупок сохраняется в таблице payments и не затрагивается.
+    """
+    cur = _db().execute(
+        "DELETE FROM subscriptions WHERE paid_until < datetime('now', ?)",
+        (f"-{days} days",),
+    )
+    _db().commit()
+    deleted = cur.rowcount
+    if deleted:
+        logger.info("Очистка подписок: удалено %d истёкших записей старше %d дней", deleted, days)
+    return deleted
+
+
+# ---------------------------------------------------------------------------
+# Payments (audit log — never deleted)
+# ---------------------------------------------------------------------------
+
+def get_payment_stats() -> dict:
+    """Аналитика выручки и оттока для /admin."""
+    row = _db().execute("""
+        SELECT
+            COALESCE(SUM(CASE WHEN paid_at >= date('now', 'start of day')
+                              THEN stars_amount END), 0)  AS today_stars,
+            COUNT(CASE WHEN paid_at >= date('now', 'start of day')
+                              THEN 1 END)                 AS today_count,
+            COALESCE(SUM(CASE WHEN paid_at >= date('now', '-30 days')
+                              THEN stars_amount END), 0)  AS month_stars,
+            COUNT(CASE WHEN paid_at >= date('now', '-30 days')
+                              THEN 1 END)                 AS month_count,
+            COALESCE(SUM(stars_amount), 0)                AS total_stars,
+            COUNT(*)                                      AS total_count
+        FROM payments
+    """).fetchone()
+
+    # Новые подписчики за 30 дней — те, чья первая оплата была в этом периоде
+    new_users = _db().execute("""
+        SELECT COUNT(*) AS cnt FROM (
+            SELECT user_id FROM payments
+            GROUP BY user_id
+            HAVING MIN(paid_at) >= date('now', '-30 days')
+        )
+    """).fetchone()["cnt"]
+
+    # Продления за 30 дней — повторные оплаты пользователей с историей
+    renewals = _db().execute("""
+        SELECT COUNT(DISTINCT user_id) AS cnt FROM payments
+        WHERE paid_at >= date('now', '-30 days')
+          AND EXISTS (
+              SELECT 1 FROM payments p2
+              WHERE p2.user_id = payments.user_id
+                AND p2.paid_at < payments.paid_at
+          )
+    """).fetchone()["cnt"]
+
+    # Отток за 30 дней — пользователи, чья последняя оплата была 30–60 дней назад
+    # (подписка уже истекла, новой оплаты нет)
+    churned = _db().execute("""
+        SELECT COUNT(*) AS cnt FROM (
+            SELECT user_id FROM payments
+            GROUP BY user_id
+            HAVING MAX(paid_at) >= date('now', '-60 days')
+               AND MAX(paid_at) <  date('now', '-30 days')
+        )
+    """).fetchone()["cnt"]
+
+    # Удержание: из тех кто платил 30–60 дней назад, сколько продлили
+    retained = _db().execute("""
+        SELECT COUNT(*) AS cnt FROM (
+            SELECT user_id FROM payments
+            GROUP BY user_id
+            HAVING MAX(paid_at) >= date('now', '-60 days')
+               AND MAX(paid_at) <  date('now', '-30 days')
+               AND COUNT(*) > 1
+        )
+    """).fetchone()["cnt"]
+
+    base = churned + retained
+    retention_pct = round(retained / base * 100) if base else None
+
+    return {
+        "today_stars":    row["today_stars"],
+        "today_count":    row["today_count"],
+        "month_stars":    row["month_stars"],
+        "month_count":    row["month_count"],
+        "total_stars":    row["total_stars"],
+        "total_count":    row["total_count"],
+        "new_users_30d":  new_users,
+        "renewals_30d":   renewals,
+        "churned_30d":    churned,
+        "retention_pct":  retention_pct,
+    }
+
+def log_payment(user_id: int, region_guid: str, stars_amount: int,
+                telegram_charge_id: str, invoice_payload: str) -> None:
+    """Записать факт оплаты. Таблица payments не очищается."""
+    _db().execute(
+        """INSERT INTO payments
+               (user_id, region_guid, stars_amount, telegram_charge_id, invoice_payload)
+           VALUES (?, ?, ?, ?, ?)""",
+        (user_id, region_guid, stars_amount, telegram_charge_id, invoice_payload),
+    )
+    _db().commit()
 
 
 # ---------------------------------------------------------------------------

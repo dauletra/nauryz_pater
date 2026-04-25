@@ -15,7 +15,7 @@ cron (*/10) → run_crawler.py → runner.run_all_regions()
         crawler.fetch_all_listings(region_guid, region_name)
         → storage: upsert_object + save_snapshot (только при изменении)
           (всё в одной транзакции на регион — autocommit=False)
-        → notifier: send_new/changed → активным подписчикам региона
+        → notifier: send_new/changed(region_guid=...) → активным подписчикам региона
 ```
 
 *Kazakhstan: 3 города республиканского значения + 17 областей = 20 регионов.*
@@ -25,8 +25,8 @@ cron (*/10) → run_crawler.py → runner.run_all_regions()
 Telegram → nginx → uvicorn → bot.py (/webhook)
   ├── message        → команды /start /objects /my /help /admin /broadcast /run
   ├── callback_query → inline-кнопки (навигация, объекты, подписка, отписка)
-  ├── pre_checkout_query → подтвердить Stars-платёж
-  └── successful_payment → activate_subscription(user_id, region_guid, 30 дней)
+  ├── pre_checkout_query → проверить сумму == STARS_PRICE, подтвердить
+  └── successful_payment → log_payment() + activate_subscription(user_id, region_guid, 30 дней)
 ```
 
 ---
@@ -45,7 +45,7 @@ OtbasyCrawler/
   telegram_api.py   — Класс TelegramAPI: единая точка Telegram Bot API вызовов
   requirements.txt  — Зависимости: requests, fastapi, uvicorn, python-dotenv
   run_crawler.py    — Cron entry point (каждые 10 мин, защита от параллельных запусков)
-  run_daily.py      — Cron entry point (ежедневный отчёт + очистка снимков, 15:00 UTC)
+  run_daily.py      — Cron entry point (отчёт + очистка + напоминания об истечении, 14:00 UTC)
   data/             — SQLite БД (gitignore)
   venv/             — локальный venv (gitignore)
   deploy/           — Конфиги сервера (systemd, nginx, crontab, setup.sh)
@@ -101,12 +101,13 @@ tg.send_invoice(chat_id, title, description, payload, currency, prices) → bool
 
 ## База данных SQLite (storage.py)
 
-**6 таблиц:**
+**7 таблиц:**
 
 | Таблица | Назначение |
 |---|---|
 | `users` | Telegram-пользователи: user_id, username, is_admin |
-| `subscriptions` | user_id + region_guid + paid_until (ISO datetime UTC `Z`-суффикс) |
+| `subscriptions` | user_id + region_guid + paid_until + cancelled_at |
+| `payments` | Неудаляемый лог всех покупок: user_id, region_guid, stars_amount, telegram_charge_id, paid_at |
 | `objects` | Мастер-данные ЖК: inner_code, region_guid, name, address, builder… |
 | `object_snapshots` | История доступности: `price INTEGER`, FK → objects с CASCADE |
 | `crawler_state` | Оперативный статус краулера per-регион + legacy дневная статистика |
@@ -118,24 +119,41 @@ tg.send_invoice(chat_id, title, description, payload, currency, prices) → bool
 - `idx_objects_region` ON objects(region_guid)
 - `idx_subscriptions_active` ON subscriptions(region_guid, paid_until) — покрывающий
 - `idx_subscriptions_expiring` ON subscriptions(paid_until)
+- `idx_payments_user` ON payments(user_id, paid_at)
+
+**Статусы подписки (`subscriptions`):**
+
+| `paid_until` | `cancelled_at` | Смысл |
+|---|---|---|
+| > now | NULL | Активная — уведомления идут, будет показана в /my |
+| > now | задана | Мягко отменена — уведомления идут до paid_until, в /my помечена 🔕 |
+| ≤ now | любое | Истекшая — очищается через 90 дней (история в `payments` остаётся) |
 
 **Ключевые функции:**
 - `upsert_user()` / `is_admin()` / `set_admin()`
-- `activate_subscription(user_id, region_guid, days)` → продлевает от конца, если ещё активна
-- `deactivate_subscription(user_id, region_guid)` → DELETE (не обнуляет дату)
-- `get_region_subscribers(region_guid)` → list[int] активных подписчиков
+- `activate_subscription(user_id, region_guid, days)` → продлевает от конца, если ещё активна; **сбрасывает `cancelled_at = NULL`**
+- `deactivate_subscription(user_id, region_guid, immediate=True)`:
+  - `immediate=True` → DELETE (уведомления прекращаются немедленно)
+  - `immediate=False` → ставит `cancelled_at`, уведомления продолжаются до `paid_until`
+- `get_region_subscribers(region_guid)` → list[int] всех с `paid_until > now` (включая мягко отменённых)
+- `get_user_subscriptions(user_id)` → list[dict] с полями `region_guid`, `paid_until`, `cancelled_at`
+- `log_payment(user_id, region_guid, stars_amount, telegram_charge_id, invoice_payload)` → пишет в `payments`, никогда не удаляется
+- `get_payment_stats()` → dict с выручкой (сегодня/30д/всего), новыми подписчиками, продлениями, оттоком и retention%
 - `upsert_object(listing, *, autocommit=True)` — обновляет slug и url
 - `save_snapshot(inner_code, listing, *, autocommit=True)`
 - `get_latest_snapshot(inner_code)`
 - `get_region_objects(region_guid)` → все ЖК с последним снимком, сортировка по available DESC
 - `cleanup_old_snapshots(days=90)` → вызывается из run_daily.py
+- `cleanup_expired_subscriptions(days=90)` → удаляет истёкшие подписки старше N дней (`payments` не трогает)
 - `begin_transaction()` / `commit()` / `rollback()` — для батч-операций
 - `update_crawler_state()` / `update_daily_stats()` / `get_daily_stats()`
 - `get_daily_history(days=30)` → история из crawler_daily_stats
 
 **Соединение:** `threading.local()` — per-thread, WAL mode, foreign_keys=ON.
 
-**Миграция:** `_migrate_schema()` автоматически пересоздаёт `object_snapshots` если `price` имеет тип TEXT (для существующих БД до рефакторинга).
+**Миграции (`_migrate_schema()`):**
+1. Пересоздаёт `object_snapshots` если `price` имеет тип TEXT
+2. Добавляет `subscriptions.cancelled_at` если отсутствует
 
 **Формат дат:** везде `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')` — UTC с суффиксом Z.
 
@@ -203,34 +221,41 @@ FastAPI приложение. Отвечает Telegram мгновенно (200 
 Использует `tg` из `telegram_api.py` через тонкие обёртки `_send`, `_edit`, `_answer_callback`, `_answer_precheckout`, `_send_invoice`.
 
 **Команды пользователя:**
-- `/start` — приветствие + главное меню
-- `/objects` — выбор региона → список ЖК (бесплатно, из БД)
-- `/my` / `/subscriptions` — активные подписки с кнопками отписки
+- `/start` — приветствие + главное меню (три кнопки: Квартиры, Мои подписки, Помощь)
+- `/objects` — выбор региона → список ЖК (бесплатно, из БД, для всех)
+- `/my` / `/subscriptions` — подписки: активные (📍) и мягко отменённые (🔕)
 - `/help` — справка
 
 **Команды администратора** (только `is_admin=1`):
-- `/admin` — статистика: пользователи, подписки, краулер за сегодня
+- `/admin` — полная аналитика: пользователи, подписки, выручка Stars (сегодня/30д/всего), новые подписчики, продления, отток, retention%, краулер
 - `/broadcast <текст>` — рассылка всем активным подписчикам (в отдельном потоке)
 - `/addadmin <user_id>` — назначить администратора (проверяет существование в БД)
 - `/run` — запустить краулер немедленно (в отдельном потоке, защита от двойного запуска через `_crawler_lock`)
 
 **Telegram Stars (подписка):**
-- `sendInvoice(currency="XTR", provider_token="")` — инвойс в Stars
-- `pre_checkout_query` → `answerPreCheckoutQuery(ok=True)`
-- `successful_payment.invoice_payload` = `"sub:{region_guid}"` → `activate_subscription()`
+- `pre_checkout_query` → проверяет `total_amount == config.STARS_PRICE`, отклоняет несовпадение
+- `successful_payment` → `log_payment()` (сначала!) → `activate_subscription()` → уведомление пользователю + администратору
 
 **callback_data формат:**
 - `menu:main` / `menu:regions` / `menu:my` / `menu:help` / `menu:objects`
-- `subscribe:{guid}` → показать карточку региона с ценой
-- `pay:{guid}` → отправить Stars-инвойс
-- `unsub:{guid}` → запросить подтверждение
-- `unsub_confirm:{guid}` → отписаться
-- `sub_info:{guid}` → тост с датой истечения (answerCallbackQuery с текстом)
-- `regions_page:{n}` → постраничная навигация (подписки)
+- `menu:regions` — редиректит в objects-flow (единый вход)
 - `objects_region:{guid}` → показать список ЖК региона
-- `objects_page:{n}` → постраничная навигация (объекты)
+- `objects_page:{n}` → постраничная навигация
+- `subscribe:{guid}` → карточка подписки с живыми данными (кол-во доступных ЖК)
+- `pay:{guid}` → отправить Stars-инвойс
+- `manage_sub:{guid}` → экран управления подпиской (Продлить / Отписаться)
+- `unsub:{guid}` → экран отписки с двумя вариантами
+- `unsub_soft:{guid}` → мягкая отмена (уведомления до paid_until, `cancelled_at` ставится)
+- `unsub_confirm:{guid}` → немедленная отписка (DELETE)
+- `sub_info:{guid}` → тост с датой истечения
+- `regions_page:{n}` → постраничная навигация
 
-**`_kb_regions_page`** принимает `item_prefix`, `page_prefix`, `back_callback` — переиспользуется для flow подписки и просмотра объектов.
+**Клавиатуры:**
+- `_kb_main_menu()` — три кнопки: Квартиры / Мои подписки / Помощь
+- `_kb_regions_page(page, item_prefix, page_prefix, back_callback)` — переиспользуется для объектов
+- `_kb_manage_sub(region_guid)` — для активной подписки: Продлить / Назад / Отписаться
+- `_kb_manage_sub_cancelled(region_guid)` — для мягко отменённой: Возобновить / Остановить сейчас / Назад
+- `_kb_confirm_unsub(region_guid, until_str)` — три варианта: получать до DATE / остановить сейчас / отмена
 
 **Безопасность:**
 - Все данные из БД в HTML-сообщениях экранируются через `html.escape()`
@@ -245,12 +270,29 @@ FastAPI приложение. Отвечает Telegram мгновенно (200 
 Отправка сообщений через `tg` из `telegram_api.py`. Правило: ≤ 10 объектов → отдельное сообщение на каждый, > 10 → одно сводное.
 
 **Публичные функции:**
-- `send_message(text, chat_id, parse_mode="HTML")` → bool — для broadcast и уведомлений администратора
-- `send_new_listings(listings, chat_id)` — новые объекты
-- `send_changed_listings(changed, chat_id)` — изменения доступности
+- `send_message(text, chat_id, parse_mode="HTML")` → bool
+- `send_new_listings(listings, chat_id, region_guid=None)` — новые объекты; кнопка "Все объекты в регионе" на последнем сообщении
+- `send_changed_listings(changed, chat_id, region_guid=None)` — изменения; аналогичная кнопка
 - `send_subscription_activated(chat_id, region_name, paid_until)`
-- `send_subscription_expiring(chat_id, region_name, paid_until, days_left)`
+- `send_subscription_expiring(chat_id, region_name, region_guid, paid_until, days_left)` — с inline-кнопкой "Продлить"; заголовок меняется: за 7 дней — "⏳ скоро истекает", за 1 день — "🚨 истекает завтра!"
+- `send_subscription_expired(chat_id, region_name, region_guid)` — win-back с кнопкой "Возобновить"
 - `send_daily_report(runs, new, changed, total, chat_id)`
+
+`_send_message` поддерживает `**kwargs` (в т.ч. `reply_markup`) и передаёт их в `tg.send_message`.
+
+---
+
+## run_daily.py
+
+Запускается cron'ом в 14:00 UTC (20:00 Алматы). Выполняет четыре задачи:
+
+1. `cleanup_old_snapshots(days=90)` — удаляет старые снимки
+2. `cleanup_expired_subscriptions(days=90)` — удаляет давно истёкшие подписки (payments не трогает)
+3. Ежедневный отчёт администратору
+4. Цепочка напоминаний об истечении:
+   - За ~7 дней (`days_from=6, days_to=7`) — мягкое: "⏳ скоро истекает"
+   - За ~1 день (`days_from=0, days_to=1`) — срочное: "🚨 истекает завтра!"
+   - Win-back: подписки, истёкшие за последние 24 часа → "⏰ Подписка истекла, возобновить?"
 
 ---
 
@@ -263,7 +305,7 @@ FastAPI приложение. Отвечает Telegram мгновенно (200 
 | `TELEGRAM_TOKEN` | `""` | Токен бота от @BotFather |
 | `WEBHOOK_SECRET` | `""` | Секрет для проверки запросов от Telegram |
 | `SQLITE_PATH` | `data/otbasy.db` | Путь к файлу БД |
-| `STARS_PRICE` | `50` | Цена подписки в Telegram Stars |
+| `STARS_PRICE` | `250` | Цена подписки в Telegram Stars |
 | `SUBSCRIPTION_DAYS` | `30` | Срок подписки в днях |
 | `ADMIN_USER_ID` | `0` | Telegram user_id администратора |
 
@@ -277,7 +319,7 @@ FastAPI приложение. Отвечает Telegram мгновенно (200 
 
 Cron на VPS (Ubuntu, UTC по умолчанию):
 - `*/10 * * * *` — краулер каждые 10 мин
-- `0 15 * * *` — ежедневный отчёт (15:00 UTC = 20:00 Алматы)
+- `0 14 * * *` — ежедневный отчёт (14:00 UTC = 20:00 Алматы)
 
 ---
 
@@ -288,12 +330,21 @@ Cron на VPS (Ubuntu, UTC по умолчанию):
 - Не использовать `requests` напрямую в `bot.py` или `notifier.py`
 - Лимит рассылки: 30 сообщений/сек глобально → `time.sleep(0.05)` между отправками
 
+**Платежи:**
+- `log_payment()` вызывается **до** `activate_subscription()` в `_handle_successful_payment`
+- Таблицу `payments` никогда не чистить — это аудит-лог
+
+**Подписки:**
+- `get_region_subscribers()` возвращает всех с `paid_until > now`, включая мягко отменённых (`cancelled_at IS NOT NULL`) — они оплатили и должны получать уведомления
+- `deactivate_subscription(immediate=False)` — только ставит `cancelled_at`, не удаляет запись
+- `activate_subscription()` всегда сбрасывает `cancelled_at = NULL`
+
 **Транзакции в storage.py:**
 - Одиночные операции: `upsert_object(listing)` — коммитит сам (autocommit=True по умолчанию)
 - Батч (runner.py): передавать `autocommit=False`, вызвать `storage.commit()` в конце, `storage.rollback()` в except
 
 **SQL-запросы:**
-- Проверить индексы для WHERE-условий (есть: `idx_snapshots_inner_code`, `idx_subscriptions_active`, `idx_subscriptions_expiring`, `idx_objects_region`)
+- Проверить индексы для WHERE-условий
 - Для получения последнего снимка использовать CTE: `WITH latest AS (SELECT inner_code, MAX(id) FROM object_snapshots GROUP BY inner_code)` — не коррелированный подзапрос
 
 **Схема БД:**
