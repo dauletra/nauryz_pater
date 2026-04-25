@@ -1,31 +1,22 @@
 import logging
 from datetime import datetime
 
-import requests
-
 import config
+from telegram_api import tg
 
 logger = logging.getLogger(__name__)
 
 MAX_SINGLE_MESSAGES = 10
 
 
+def send_message(text: str, chat_id: str, parse_mode: str = "HTML") -> bool:
+    """Публичный метод для отправки произвольного сообщения (broadcast и др.)."""
+    return tg.send_message(chat_id, text, parse_mode=parse_mode)
+
+
 def _send_message(text: str, parse_mode: str = "HTML", chat_id: str | None = None) -> bool:
     target = chat_id or config.TELEGRAM_CHAT_ID
-    url = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}/sendMessage"
-    try:
-        resp = requests.post(
-            url,
-            json={"chat_id": target, "text": text, "parse_mode": parse_mode},
-            timeout=10,
-        )
-        if not resp.ok:
-            logger.error("Telegram error %s: %s", resp.status_code, resp.text)
-            return False
-        return True
-    except Exception as e:
-        logger.error("Ошибка отправки в Telegram: %s", e)
-        return False
+    return tg.send_message(target, text, parse_mode=parse_mode)
 
 
 def _finishing_line(card: dict) -> str:
@@ -48,7 +39,8 @@ def _card_message(card: dict, header: str = "🏠 <b>Новый объект н�
     if card.get("address"):
         lines.append(f"📍 {card['address']}")
     if card.get("price"):
-        lines.append(f"💰 от {card['price']} ₸/м²")
+        price_fmt = f"{card['price']:,}".replace(",", " ")
+        lines.append(f"💰 от {price_fmt} ₸/м²")
     if card.get("available") is not None:
         lines.append(f"🏢 Доступно квартир: <b>{card['available']}</b>")
     finishing = _finishing_line(card)

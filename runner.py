@@ -20,10 +20,7 @@ def _find_diffs(prev: dict, current: dict) -> dict:
 
 
 def run_region(region_guid: str, region_name: str) -> dict:
-    """Обойти один регион, сохранить изменения, уведомить подписчиков.
-
-    Возвращает {"new": N, "changed": N, "total": N}.
-    """
+    """Обойти один регион, сохранить изменения, уведомить подписчиков."""
     logger.info("=== Регион: %s ===", region_name)
 
     try:
@@ -40,21 +37,28 @@ def run_region(region_guid: str, region_name: str) -> dict:
     new_objects:     list[dict] = []
     changed_objects: list[dict] = []
 
-    for listing in current_listings:
-        storage.upsert_object(listing)
+    try:
+        for listing in current_listings:
+            storage.upsert_object(listing, autocommit=False)
+            prev_snapshot = storage.get_latest_snapshot(listing["id"])
 
-        prev_snapshot = storage.get_latest_snapshot(listing["id"])
+            if prev_snapshot is None:
+                storage.save_snapshot(listing["id"], listing, autocommit=False)
+                new_objects.append(listing)
+            else:
+                diffs = _find_diffs(prev_snapshot, listing)
+                if diffs:
+                    listing["diffs"] = diffs
+                    storage.save_snapshot(listing["id"], listing, autocommit=False)
+                    changed_objects.append(listing)
+                    logger.info("[%s] Изменение [%s]: %s", region_name, listing["id"], diffs)
 
-        if prev_snapshot is None:
-            storage.save_snapshot(listing["id"], listing)
-            new_objects.append(listing)
-        else:
-            diffs = _find_diffs(prev_snapshot, listing)
-            if diffs:
-                listing["diffs"] = diffs
-                storage.save_snapshot(listing["id"], listing)
-                changed_objects.append(listing)
-                logger.info("[%s] Изменение [%s]: %s", region_name, listing["id"], diffs)
+        storage.commit()
+    except Exception as e:
+        storage.rollback()
+        logger.error("[%s] Ошибка записи в БД, откат: %s", region_name, e, exc_info=True)
+        storage.update_crawler_state(region_guid, "error", error=str(e))
+        return {"new": 0, "changed": 0, "total": 0}
 
     storage.update_crawler_state(region_guid, "ok", count=len(current_listings))
     storage.update_daily_stats(region_guid, len(new_objects), len(changed_objects))
@@ -62,7 +66,6 @@ def run_region(region_guid: str, region_name: str) -> dict:
     logger.info("[%s] Итого: новых=%d изменений=%d всего=%d",
                 region_name, len(new_objects), len(changed_objects), len(current_listings))
 
-    # Уведомить подписчиков только если есть что сообщить
     if new_objects or changed_objects:
         subscribers = storage.get_region_subscribers(region_guid)
         if subscribers:
@@ -81,11 +84,7 @@ def run_region(region_guid: str, region_name: str) -> dict:
 
 
 def run_all_regions() -> dict:
-    """Обойти все регионы Казахстана.
-
-    Шаг 1: краулинг всех 21 региона — база всегда актуальна.
-    Шаг 2: уведомить подписчиков тех регионов, где есть изменения.
-    """
+    """Обойти все регионы Казахстана."""
     total = {"new": 0, "changed": 0, "total": 0}
 
     for region_guid, region_name in regions.get_all_regions():
@@ -100,6 +99,5 @@ def run_all_regions() -> dict:
 
 
 def run_single_region(region_guid: str) -> dict:
-    """Запустить краулер для одного региона (используется командой /run в боте)."""
     region_name = regions.get_region_name(region_guid)
     return run_region(region_guid, region_name)

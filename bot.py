@@ -1,7 +1,9 @@
+import html
 import logging
-from datetime import datetime, timezone
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 
-import requests
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import Response
 
@@ -10,6 +12,9 @@ import notifier
 import regions
 import runner
 import storage
+from telegram_api import tg
+
+_crawler_lock = threading.Lock()
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -19,62 +24,38 @@ logging.basicConfig(
 
 app = FastAPI()
 
-# Telegram Bot API base URL
-_TG = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}"
-
 
 # ---------------------------------------------------------------------------
-# Low-level Telegram helpers
+# Low-level Telegram helpers (тонкие обёртки над TelegramAPI)
 # ---------------------------------------------------------------------------
 
-def _send(chat_id: int | str, text: str, **kwargs) -> dict:
-    resp = requests.post(
-        f"{_TG}/sendMessage",
-        json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", **kwargs},
-        timeout=10,
-    )
-    return resp.json()
+def _send(chat_id: int | str, text: str, **kwargs) -> bool:
+    return tg.send_message(chat_id, text, **kwargs)
 
 
-def _edit(chat_id: int | str, message_id: int, text: str, reply_markup=None) -> None:
-    payload = {"chat_id": chat_id, "message_id": message_id,
-               "text": text, "parse_mode": "HTML"}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    requests.post(f"{_TG}/editMessageText", json=payload, timeout=10)
+def _edit(chat_id: int | str, message_id: int, text: str, reply_markup=None) -> bool:
+    return tg.edit_message_text(chat_id, message_id, text, reply_markup=reply_markup)
 
 
-def _answer_callback(callback_query_id: str, text: str = "") -> None:
-    requests.post(
-        f"{_TG}/answerCallbackQuery",
-        json={"callback_query_id": callback_query_id, "text": text},
-        timeout=10,
-    )
+def _answer_callback(callback_query_id: str, text: str = "") -> bool:
+    return tg.answer_callback_query(callback_query_id, text)
 
 
-def _answer_precheckout(query_id: str, ok: bool, error: str = "") -> None:
-    payload: dict = {"pre_checkout_query_id": query_id, "ok": ok}
-    if not ok and error:
-        payload["error_message"] = error
-    requests.post(f"{_TG}/answerPreCheckoutQuery", json=payload, timeout=10)
+def _answer_precheckout(query_id: str, ok: bool, error: str = "") -> bool:
+    return tg.answer_pre_checkout_query(query_id, ok, error)
 
 
-def _send_invoice(chat_id: int | str, region_guid: str, region_name: str) -> None:
-    requests.post(
-        f"{_TG}/sendInvoice",
-        json={
-            "chat_id":       chat_id,
-            "title":         f"Подписка: {region_name}",
-            "description":   (
-                f"Уведомления о новых квартирах в регионе «{region_name}» "
-                f"на {config.SUBSCRIPTION_DAYS} дней"
-            ),
-            "payload":       f"sub:{region_guid}",
-            "currency":      "XTR",
-            "prices":        [{"label": "Подписка", "amount": config.STARS_PRICE}],
-            "provider_token": "",   # пустая строка = Telegram Stars
-        },
-        timeout=10,
+def _send_invoice(chat_id: int | str, region_guid: str, region_name: str) -> bool:
+    return tg.send_invoice(
+        chat_id,
+        title=f"Подписка: {region_name}",
+        description=(
+            f"Уведомления о новых квартирах в регионе «{region_name}» "
+            f"на {config.SUBSCRIPTION_DAYS} дней"
+        ),
+        payload=f"sub:{region_guid}",
+        currency="XTR",
+        prices=[{"label": "Подписка", "amount": config.STARS_PRICE}],
     )
 
 
@@ -85,14 +66,18 @@ def _send_invoice(chat_id: int | str, region_guid: str, region_name: str) -> Non
 def _kb_main_menu() -> dict:
     return {"inline_keyboard": [
         [{"text": "🗺 Выбрать регион",    "callback_data": "menu:regions"}],
+        [{"text": "📦 Объекты",           "callback_data": "menu:objects"}],
         [{"text": "📋 Мои подписки",      "callback_data": "menu:my"}],
         [{"text": "❓ Помощь",            "callback_data": "menu:help"}],
     ]}
 
 
-def _kb_regions_page(page: int = 0) -> dict:
-    """Клавиатура выбора региона — по 3 кнопки в ряд, постраничная."""
-    all_regions = regions.get_all_regions()  # [(guid, name), ...]
+def _kb_regions_page(page: int = 0,
+                     item_prefix: str = "subscribe",
+                     page_prefix: str = "regions_page",
+                     back_callback: str = "menu:main") -> dict:
+    """Постраничный список регионов. Префиксы позволяют переиспользовать для разных flow."""
+    all_regions = regions.get_all_regions()
     PAGE_SIZE = 12
     start = page * PAGE_SIZE
     chunk = all_regions[start: start + PAGE_SIZE]
@@ -100,23 +85,39 @@ def _kb_regions_page(page: int = 0) -> dict:
     rows = []
     row: list = []
     for guid, name in chunk:
-        row.append({"text": name, "callback_data": f"subscribe:{guid}"})
+        row.append({"text": name, "callback_data": f"{item_prefix}:{guid}"})
         if len(row) == 3:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
 
-    # Навигация если регионов больше одной страницы
     nav = []
     if page > 0:
-        nav.append({"text": "◀ Назад", "callback_data": f"regions_page:{page - 1}"})
+        nav.append({"text": "◀ Назад", "callback_data": f"{page_prefix}:{page - 1}"})
     if start + PAGE_SIZE < len(all_regions):
-        nav.append({"text": "Вперёд ▶", "callback_data": f"regions_page:{page + 1}"})
+        nav.append({"text": "Вперёд ▶", "callback_data": f"{page_prefix}:{page + 1}"})
     if nav:
         rows.append(nav)
 
-    rows.append([{"text": "🔙 Главное меню", "callback_data": "menu:main"}])
+    rows.append([{"text": "🔙 Главное меню", "callback_data": back_callback}])
+    return {"inline_keyboard": rows}
+
+
+def _kb_objects_region(region_guid: str, sub_until: str | None) -> dict:
+    rows = []
+    if sub_until:
+        try:
+            until = datetime.fromisoformat(sub_until).strftime("%d.%m.%Y")
+        except Exception:
+            until = sub_until[:10]
+        rows.append([{"text": f"🔔 Подписан до {until}",
+                      "callback_data": f"sub_info:{region_guid}"}])
+    else:
+        rows.append([{"text": f"🔔 Подписаться · {config.STARS_PRICE} Stars",
+                      "callback_data": f"subscribe:{region_guid}"}])
+    rows.append([{"text": "🔙 К регионам", "callback_data": "objects_page:0"}])
+    rows.append([{"text": "🏠 Главное меню", "callback_data": "menu:main"}])
     return {"inline_keyboard": rows}
 
 
@@ -151,8 +152,8 @@ def _kb_my_subscriptions(subs: list[dict]) -> dict:
 
 def _kb_confirm_unsub(region_guid: str) -> dict:
     return {"inline_keyboard": [
-        [{"text": "✅ Да, отписаться",   "callback_data": f"unsub_confirm:{region_guid}"}],
-        [{"text": "❌ Отмена",           "callback_data": "menu:my"}],
+        [{"text": "✅ Да, отписаться",  "callback_data": f"unsub_confirm:{region_guid}"}],
+        [{"text": "❌ Отмена",          "callback_data": "menu:my"}],
     ]}
 
 
@@ -163,11 +164,88 @@ def _kb_back_to_menu() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Objects list helpers
+# ---------------------------------------------------------------------------
+
+def _format_objects_message(region_name: str, objects: list[dict]) -> str:
+    available   = [o for o in objects if o.get("available")]
+    unavailable = [o for o in objects if not o.get("available")]
+
+    timestamps = [o["timestamp"] for o in objects if o.get("timestamp")]
+    if timestamps:
+        try:
+            last_ts  = max(datetime.fromisoformat(t) for t in timestamps)
+            last_ts  = last_ts.replace(tzinfo=timezone.utc)
+            almaty   = last_ts + timedelta(hours=5)
+            time_str = almaty.strftime("%d.%m %H:%M")
+        except Exception:
+            time_str = "—"
+    else:
+        time_str = "—"
+
+    lines = [f"📍 <b>{html.escape(region_name)}</b>  ·  ⏱ {time_str} (UTC+5)", ""]
+
+    if not objects:
+        lines.append("В базе пока нет данных по этому региону.")
+        return "\n".join(lines)
+
+    if available:
+        lines.append(f"✅ <b>Доступные квартиры ({len(available)}):</b>")
+        for i, o in enumerate(available, 1):
+            name      = html.escape(o.get("name") or o.get("address") or "—")
+            avail     = o["available"]
+            price     = o.get("price")
+            price_str = f" · {price:,} ₸/м²".replace(",", " ") if price else ""
+            url       = o.get("url", "")
+            label     = f'<a href="{html.escape(url)}">{name}</a>' if url else name
+            lines.append(f"{i}. {label} — <b>{avail} кв.</b>{price_str}")
+    else:
+        lines.append("✅ <b>Доступных квартир нет</b>")
+
+    lines.append("")
+
+    if unavailable:
+        names = [html.escape(o.get("name") or o.get("address") or "—")
+                 for o in unavailable]
+        lines.append(f"📭 <b>Нет доступных ({len(unavailable)}):</b>")
+        chunk, cur_len, chunks = [], 0, []
+        for n in names:
+            if cur_len + len(n) > 80 and chunk:
+                chunks.append(", ".join(chunk))
+                chunk, cur_len = [], 0
+            chunk.append(n)
+            cur_len += len(n) + 2
+        if chunk:
+            chunks.append(", ".join(chunk))
+        lines.extend(chunks)
+
+    return "\n".join(lines)
+
+
+def _show_region_objects(user_id: int, msg_id: int, region_guid: str) -> None:
+    region_name = regions.get_region_name(region_guid)
+    objects     = storage.get_region_objects(region_guid)
+    text        = _format_objects_message(region_name, objects)
+
+    sub = next(
+        (s for s in storage.get_user_subscriptions(user_id)
+         if s["region_guid"] == region_guid),
+        None,
+    )
+    sub_until = sub["paid_until"] if sub else None
+
+    if len(text) > 4000:
+        text = text[:3950] + "\n\n<i>...список обрезан</i>"
+
+    _edit(user_id, msg_id, text, reply_markup=_kb_objects_region(region_guid, sub_until))
+
+
+# ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
 
 def _handle_start(user_id: int, first_name: str) -> None:
-    name = first_name or "пользователь"
+    name = html.escape(first_name or "пользователь")
     _send(
         user_id,
         f"👋 Привет, <b>{name}</b>!\n\n"
@@ -194,6 +272,18 @@ def _handle_my(user_id: int) -> None:
         )
 
 
+def _handle_objects(user_id: int) -> None:
+    _send(
+        user_id,
+        "📦 <b>Объекты на Baspana</b>\n\nВыберите регион:",
+        reply_markup=_kb_regions_page(
+            item_prefix="objects_region",
+            page_prefix="objects_page",
+            back_callback="menu:main",
+        ),
+    )
+
+
 def _handle_help(user_id: int) -> None:
     _send(
         user_id,
@@ -202,6 +292,7 @@ def _handle_help(user_id: int) -> None:
         "и присылает уведомления по вашим регионам.\n\n"
         "<b>Команды:</b>\n"
         "/start — главное меню\n"
+        "/objects — список ЖК по региону\n"
         "/my — мои подписки\n"
         "/help — эта справка\n\n"
         "<b>Подписка:</b>\n"
@@ -240,11 +331,17 @@ def _handle_broadcast(user_id: int, text: str) -> None:
         _send(user_id, "Использование: /broadcast <текст>")
         return
     recipients = storage.get_all_active_user_ids()
-    sent = 0
-    for uid in recipients:
-        if notifier._send_message(text, chat_id=str(uid)):
-            sent += 1
-    _send(user_id, f"✅ Отправлено {sent} из {len(recipients)} пользователей.")
+    _send(user_id, f"⏳ Рассылка {len(recipients)} пользователям...")
+
+    def _do_broadcast() -> None:
+        sent = 0
+        for uid in recipients:
+            if notifier.send_message(text, chat_id=str(uid)):
+                sent += 1
+            time.sleep(0.05)
+        _send(user_id, f"✅ Отправлено {sent} из {len(recipients)} пользователей.")
+
+    threading.Thread(target=_do_broadcast, daemon=True).start()
 
 
 def _handle_add_admin(actor_id: int, args: str) -> None:
@@ -252,6 +349,11 @@ def _handle_add_admin(actor_id: int, args: str) -> None:
         target_id = int(args.strip())
     except ValueError:
         _send(actor_id, "Использование: /addadmin <user_id>")
+        return
+    if not storage.get_user(target_id):
+        _send(actor_id,
+              f"❌ Пользователь {target_id} не найден в базе.\n"
+              f"Он должен написать боту хотя бы раз.")
         return
     storage.set_admin(target_id)
     _send(actor_id, f"✅ Пользователь {target_id} назначен администратором.")
@@ -269,9 +371,14 @@ def _handle_callback(callback_query: dict) -> None:
     msg_id  = msg.get("message_id")
     data    = callback_query.get("data", "")
 
-    _answer_callback(cq_id)
+    if not user_id or not msg_id:
+        logger.warning("callback_query без user_id или msg_id, пропускаю")
+        return
 
-    # Зарегистрировать пользователя если ещё нет
+    # sub_info отвечает с текстом — для остальных отвечаем пустым чтобы убрать spinner
+    if not data.startswith("sub_info:"):
+        _answer_callback(cq_id)
+
     storage.upsert_user(
         user_id,
         user.get("username"),
@@ -281,13 +388,14 @@ def _handle_callback(callback_query: dict) -> None:
 
     # --- Навигация ---
     if data == "menu:main":
-        _edit(user_id, msg_id,
-              "Главное меню:", reply_markup=_kb_main_menu())
+        _edit(user_id, msg_id, "Главное меню:", reply_markup=_kb_main_menu())
 
     elif data == "menu:regions" or data.startswith("regions_page:"):
-        page = int(data.split(":")[1]) if data.startswith("regions_page:") else 0
-        _edit(user_id, msg_id,
-              "🗺 <b>Выберите регион:</b>",
+        try:
+            page = int(data.split(":")[1]) if data.startswith("regions_page:") else 0
+        except (ValueError, IndexError):
+            page = 0
+        _edit(user_id, msg_id, "🗺 <b>Выберите регион:</b>",
               reply_markup=_kb_regions_page(page))
 
     elif data == "menu:my":
@@ -300,6 +408,36 @@ def _handle_callback(callback_query: dict) -> None:
             _edit(user_id, msg_id,
                   f"📋 <b>Ваши активные подписки ({len(subs)}):</b>",
                   reply_markup=_kb_my_subscriptions(subs))
+
+    elif data == "menu:objects":
+        _edit(user_id, msg_id,
+              "📦 <b>Объекты на Baspana</b>\n\nВыберите регион:",
+              reply_markup=_kb_regions_page(
+                  item_prefix="objects_region",
+                  page_prefix="objects_page",
+                  back_callback="menu:main",
+              ))
+
+    elif data.startswith("objects_page:"):
+        try:
+            page = int(data.split(":")[1])
+        except (ValueError, IndexError):
+            page = 0
+        _edit(user_id, msg_id,
+              "📦 <b>Объекты на Baspana</b>\n\nВыберите регион:",
+              reply_markup=_kb_regions_page(
+                  page=page,
+                  item_prefix="objects_region",
+                  page_prefix="objects_page",
+                  back_callback="menu:main",
+              ))
+
+    elif data.startswith("objects_region:"):
+        region_guid = data.split(":", 1)[1]
+        if not regions.is_valid_region(region_guid):
+            logger.warning("Недействительный region_guid в objects_region: %s", region_guid)
+            return
+        _show_region_objects(user_id, msg_id, region_guid)
 
     elif data == "menu:help":
         _edit(user_id, msg_id,
@@ -314,6 +452,9 @@ def _handle_callback(callback_query: dict) -> None:
     # --- Подписка ---
     elif data.startswith("subscribe:"):
         region_guid = data.split(":", 1)[1]
+        if not regions.is_valid_region(region_guid):
+            logger.warning("Недействительный region_guid в subscribe: %s", region_guid)
+            return
         region_name = regions.get_region_name(region_guid)
 
         if storage.is_subscription_active(user_id, region_guid):
@@ -324,13 +465,13 @@ def _handle_callback(callback_query: dict) -> None:
             except Exception:
                 until = "—"
             _edit(user_id, msg_id,
-                  f"✅ У вас уже есть активная подписка на <b>{region_name}</b> "
-                  f"(до {until}).",
+                  f"✅ У вас уже есть активная подписка на "
+                  f"<b>{html.escape(region_name)}</b> (до {until}).",
                   reply_markup=_kb_back_to_menu())
         else:
             _edit(
                 user_id, msg_id,
-                f"📍 <b>{region_name}</b>\n\n"
+                f"📍 <b>{html.escape(region_name)}</b>\n\n"
                 f"💫 Стоимость: <b>{config.STARS_PRICE} Telegram Stars</b>\n"
                 f"📅 Срок: {config.SUBSCRIPTION_DAYS} дней\n\n"
                 f"Нажмите кнопку ниже для оплаты через Telegram:",
@@ -339,13 +480,18 @@ def _handle_callback(callback_query: dict) -> None:
 
     elif data.startswith("pay:"):
         region_guid = data.split(":", 1)[1]
+        if not regions.is_valid_region(region_guid):
+            logger.warning("Недействительный region_guid в pay: %s", region_guid)
+            return
         region_name = regions.get_region_name(region_guid)
-        # Отправить инвойс отдельным сообщением (Stars требуют отдельного сообщения)
         _send_invoice(user_id, region_guid, region_name)
 
     # --- Управление подпиской ---
     elif data.startswith("sub_info:"):
         region_guid = data.split(":", 1)[1]
+        if not regions.is_valid_region(region_guid):
+            _answer_callback(cq_id)
+            return
         region_name = regions.get_region_name(region_guid)
         subs = storage.get_user_subscriptions(user_id)
         sub  = next((s for s in subs if s["region_guid"] == region_guid), None)
@@ -355,21 +501,29 @@ def _handle_callback(callback_query: dict) -> None:
             except Exception:
                 until = sub["paid_until"]
             _answer_callback(cq_id, f"{region_name}: активна до {until}")
+        else:
+            _answer_callback(cq_id)
 
     elif data.startswith("unsub:"):
         region_guid = data.split(":", 1)[1]
+        if not regions.is_valid_region(region_guid):
+            logger.warning("Недействительный region_guid в unsub: %s", region_guid)
+            return
         region_name = regions.get_region_name(region_guid)
         _edit(user_id, msg_id,
-              f"❓ Отписаться от <b>{region_name}</b>?\n\n"
+              f"❓ Отписаться от <b>{html.escape(region_name)}</b>?\n\n"
               f"Вы перестанете получать уведомления по этому региону.",
               reply_markup=_kb_confirm_unsub(region_guid))
 
     elif data.startswith("unsub_confirm:"):
         region_guid = data.split(":", 1)[1]
+        if not regions.is_valid_region(region_guid):
+            logger.warning("Недействительный region_guid в unsub_confirm: %s", region_guid)
+            return
         region_name = regions.get_region_name(region_guid)
         storage.deactivate_subscription(user_id, region_guid)
         _edit(user_id, msg_id,
-              f"✅ Вы отписались от <b>{region_name}</b>.",
+              f"✅ Вы отписались от <b>{html.escape(region_name)}</b>.",
               reply_markup=_kb_back_to_menu())
 
     else:
@@ -381,7 +535,6 @@ def _handle_callback(callback_query: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _handle_pre_checkout(query: dict) -> None:
-    """Всегда подтверждаем — Stars не требуют дополнительной проверки."""
     _answer_precheckout(query["id"], ok=True)
 
 
@@ -402,13 +555,12 @@ def _handle_successful_payment(user_id: int, payment: dict) -> None:
 
     notifier.send_subscription_activated(str(user_id), region_name, paid_until)
 
-    # Уведомить администратора
     if config.ADMIN_USER_ID:
         stars = payment.get("total_amount", config.STARS_PRICE)
-        notifier._send_message(
+        notifier.send_message(
             f"💰 <b>Новая оплата</b>\n"
             f"👤 User ID: {user_id}\n"
-            f"📍 Регион: {region_name}\n"
+            f"📍 Регион: {html.escape(region_name)}\n"
             f"💫 Stars: {stars}",
             chat_id=str(config.ADMIN_USER_ID),
         )
@@ -419,7 +571,6 @@ def _handle_successful_payment(user_id: int, payment: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _handle_update(update: dict) -> None:
-    # 1. Callback query (нажатие inline-кнопки)
     if "callback_query" in update:
         try:
             _handle_callback(update["callback_query"])
@@ -427,7 +578,6 @@ def _handle_update(update: dict) -> None:
             logger.error("Ошибка callback_query: %s", e, exc_info=True)
         return
 
-    # 2. Pre-checkout query (подтверждение оплаты Stars)
     if "pre_checkout_query" in update:
         try:
             _handle_pre_checkout(update["pre_checkout_query"])
@@ -435,7 +585,6 @@ def _handle_update(update: dict) -> None:
             logger.error("Ошибка pre_checkout_query: %s", e, exc_info=True)
         return
 
-    # 3. Message
     message = update.get("message", {})
     if not message:
         return
@@ -445,7 +594,6 @@ def _handle_update(update: dict) -> None:
     if not user_id:
         return
 
-    # 3a. Successful payment (Stars)
     if "successful_payment" in message:
         try:
             _handle_successful_payment(user_id, message["successful_payment"])
@@ -457,7 +605,6 @@ def _handle_update(update: dict) -> None:
     if not text:
         return
 
-    # Зарегистрировать / обновить пользователя при каждом сообщении
     storage.upsert_user(
         user_id,
         user.get("username"),
@@ -465,18 +612,19 @@ def _handle_update(update: dict) -> None:
         user.get("last_name"),
     )
 
-    # Инициализировать первого пользователя как администратора
     if config.ADMIN_USER_ID and user_id == config.ADMIN_USER_ID:
         user_data = storage.get_user(user_id)
         if user_data and not user_data.get("is_admin"):
             storage.set_admin(user_id, True)
 
-    cmd  = text.split()[0].lower().split("@")[0]   # убрать @botname
+    cmd  = text.split()[0].lower().split("@")[0]
     args = text[len(cmd):].strip()
 
-    # --- Пользовательские команды ---
     if cmd == "/start":
         _handle_start(user_id, user.get("first_name", ""))
+
+    elif cmd == "/objects":
+        _handle_objects(user_id)
 
     elif cmd in ("/my", "/subscriptions"):
         _handle_my(user_id)
@@ -484,7 +632,6 @@ def _handle_update(update: dict) -> None:
     elif cmd == "/help":
         _handle_help(user_id)
 
-    # --- Администраторские команды ---
     elif cmd == "/admin":
         if storage.is_admin(user_id):
             _handle_admin(user_id)
@@ -505,20 +652,28 @@ def _handle_update(update: dict) -> None:
 
     elif cmd == "/run":
         if storage.is_admin(user_id):
-            _send(user_id, "⏳ Запускаю краулер по всем регионам...")
-            try:
-                result = runner.run_all_regions()
-                _send(user_id,
-                      f"✅ Готово: новых <b>{result['new']}</b>, "
-                      f"изменений <b>{result['changed']}</b>, "
-                      f"всего объектов {result['total']}")
-            except Exception as e:
-                _send(user_id, f"❌ Ошибка: {str(e)[:200]}")
+            if not _crawler_lock.acquire(blocking=False):
+                _send(user_id, "⏳ Краулер уже запущен, дождитесь завершения.")
+            else:
+                _send(user_id, "⏳ Запускаю краулер по всем регионам...")
+
+                def _do_run() -> None:
+                    try:
+                        result = runner.run_all_regions()
+                        _send(user_id,
+                              f"✅ Готово: новых <b>{result['new']}</b>, "
+                              f"изменений <b>{result['changed']}</b>, "
+                              f"всего объектов {result['total']}")
+                    except Exception as e:
+                        _send(user_id, f"❌ Ошибка: {str(e)[:200]}")
+                    finally:
+                        _crawler_lock.release()
+
+                threading.Thread(target=_do_run, daemon=True).start()
         else:
             _send(user_id, "⛔ Нет доступа.")
 
     else:
-        # Любое другое сообщение — показать меню
         _send(user_id, "Выберите действие:", reply_markup=_kb_main_menu())
 
 
@@ -528,7 +683,6 @@ def _handle_update(update: dict) -> None:
 
 @app.post("/webhook")
 async def bot_webhook(request: Request, background_tasks: BackgroundTasks) -> Response:
-    # Проверка Telegram secret token
     if config.WEBHOOK_SECRET:
         if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != config.WEBHOOK_SECRET:
             logger.warning("Неверный webhook secret token")
@@ -538,7 +692,6 @@ async def bot_webhook(request: Request, background_tasks: BackgroundTasks) -> Re
     if not update:
         return Response("ok")
 
-    # Telegram ждёт ответ в течение 60 сек — обрабатываем в фоне
     background_tasks.add_task(_handle_update, update)
     return Response("ok")
 

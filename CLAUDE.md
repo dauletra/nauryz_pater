@@ -4,16 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Архитектура
 
-Мультипользовательский Telegram-бот — мониторит новые квартиры на baspana.otbasybank.kz по всем регионам Казахстана. Пользователи подписываются на нужный регион через Telegram Stars. Каждые 10 минут краулер обходит все 20 регионов и уведомляет подписчиков о новых объектах и изменениях доступности.
+Мультипользовательский Telegram-бот — мониторит новые квартиры на baspana.otbasybank.kz по всем регионам Казахстана. Пользователи могут бесплатно просматривать список ЖК по любому региону. Платная подписка (Telegram Stars) даёт автоматические уведомления о новых объектах и изменениях доступности.
 
 **Платформа:** VPS Ubuntu 24.04 — FastAPI + uvicorn + nginx + SQLite + cron
 
 **Поток данных (краулер):**
 ```
 cron (*/10) → run_crawler.py → runner.run_all_regions()
-  └── для каждого из 21 региона:
+  └── для каждого из 20 регионов:
         crawler.fetch_all_listings(region_guid, region_name)
         → storage: upsert_object + save_snapshot (только при изменении)
+          (всё в одной транзакции на регион — autocommit=False)
         → notifier: send_new/changed → активным подписчикам региона
 ```
 
@@ -22,8 +23,8 @@ cron (*/10) → run_crawler.py → runner.run_all_regions()
 **Поток данных (бот):**
 ```
 Telegram → nginx → uvicorn → bot.py (/webhook)
-  ├── message       → команды /start /my /help /admin /broadcast /run
-  ├── callback_query → inline-кнопки (выбор региона, подписка, отписка)
+  ├── message        → команды /start /objects /my /help /admin /broadcast /run
+  ├── callback_query → inline-кнопки (навигация, объекты, подписка, отписка)
   ├── pre_checkout_query → подтвердить Stars-платёж
   └── successful_payment → activate_subscription(user_id, region_guid, 30 дней)
 ```
@@ -34,20 +35,21 @@ Telegram → nginx → uvicorn → bot.py (/webhook)
 
 ```
 OtbasyCrawler/
-  bot.py           — FastAPI webhook, все обработчики бота
-  crawler.py       — HTTP-краулер baspana.otbasybank.kz
-  storage.py       — SQLite: все операции с БД
-  notifier.py      — Telegram Bot API: форматирование и отправка сообщений
-  runner.py        — Оркестрация: run_all_regions(), run_region()
-  regions.py       — 21 регион Казахстана с GUID из API
-  config.py        — Переменные окружения (из .env через python-dotenv)
-  requirements.txt — Зависимости: requests, fastapi, uvicorn, python-dotenv
-  run_crawler.py   — Cron entry point (каждые 10 мин)
-  run_daily.py     — Cron entry point (ежедневный отчёт, 15:00 UTC = 20:00 Almaty)
-  data/            — SQLite БД (gitignore)
-  venv/            — локальный venv (gitignore)
-  deploy/          — Конфиги сервера (systemd, nginx, crontab, setup.sh)
-  functions/       — УСТАРЕЛО (Firebase-наследие, можно удалить)
+  bot.py            — FastAPI webhook, все обработчики бота
+  crawler.py        — HTTP-краулер baspana.otbasybank.kz
+  storage.py        — SQLite: все операции с БД
+  notifier.py       — Форматирование и отправка сообщений (через TelegramAPI)
+  runner.py         — Оркестрация: run_all_regions(), run_region()
+  regions.py        — 20 регионов Казахстана с GUID из API
+  config.py         — Переменные окружения (из .env через python-dotenv)
+  telegram_api.py   — Класс TelegramAPI: единая точка Telegram Bot API вызовов
+  requirements.txt  — Зависимости: requests, fastapi, uvicorn, python-dotenv
+  run_crawler.py    — Cron entry point (каждые 10 мин, защита от параллельных запусков)
+  run_daily.py      — Cron entry point (ежедневный отчёт + очистка снимков, 15:00 UTC)
+  data/             — SQLite БД (gitignore)
+  venv/             — локальный venv (gitignore)
+  deploy/           — Конфиги сервера (systemd, nginx, crontab, setup.sh)
+  functions/        — УСТАРЕЛО (Firebase-наследие, можно удалить)
 ```
 
 ---
@@ -77,24 +79,65 @@ venv/bin/python run_crawler.py          # тест краулера
 
 ---
 
+## telegram_api.py
+
+Единственное место для всех HTTP-запросов к Telegram Bot API. Используется в `bot.py` и `notifier.py`.
+
+```python
+tg = TelegramAPI(config.TELEGRAM_TOKEN)
+
+tg.send_message(chat_id, text, parse_mode="HTML", **kwargs) → bool
+tg.edit_message_text(chat_id, message_id, text, reply_markup=None) → bool
+tg.answer_callback_query(callback_query_id, text="") → bool
+tg.answer_pre_checkout_query(pre_checkout_query_id, ok, error_message="") → bool
+tg.send_invoice(chat_id, title, description, payload, currency, prices) → bool
+```
+
+Все методы возвращают `bool` (успех). Ошибки логируются через `logger.error` с `method`, `status_code`, `description`. None-значения в payload автоматически фильтруются.
+
+**Правило:** все новые Telegram API вызовы добавлять только в `TelegramAPI`. Не использовать `requests` напрямую в `bot.py` или `notifier.py`.
+
+---
+
 ## База данных SQLite (storage.py)
 
-**5 таблиц:**
+**6 таблиц:**
 
 | Таблица | Назначение |
 |---|---|
 | `users` | Telegram-пользователи: user_id, username, is_admin |
-| `subscriptions` | user_id + region_guid + paid_until (ISO datetime UTC) |
+| `subscriptions` | user_id + region_guid + paid_until (ISO datetime UTC `Z`-суффикс) |
 | `objects` | Мастер-данные ЖК: inner_code, region_guid, name, address, builder… |
-| `object_snapshots` | История доступности: запись создаётся ТОЛЬКО при изменении |
-| `crawler_state` | Статус краулера per-регион + дневная статистика |
+| `object_snapshots` | История доступности: `price INTEGER`, FK → objects с CASCADE |
+| `crawler_state` | Оперативный статус краулера per-регион + legacy дневная статистика |
+| `crawler_daily_stats` | История статистики по дням (region_guid + date = PK) |
+
+**Индексы:**
+- `idx_snapshots_inner_code` ON object_snapshots(inner_code)
+- `idx_subscriptions_region` ON subscriptions(region_guid)
+- `idx_objects_region` ON objects(region_guid)
+- `idx_subscriptions_active` ON subscriptions(region_guid, paid_until) — покрывающий
+- `idx_subscriptions_expiring` ON subscriptions(paid_until)
 
 **Ключевые функции:**
 - `upsert_user()` / `is_admin()` / `set_admin()`
 - `activate_subscription(user_id, region_guid, days)` → продлевает от конца, если ещё активна
+- `deactivate_subscription(user_id, region_guid)` → DELETE (не обнуляет дату)
 - `get_region_subscribers(region_guid)` → list[int] активных подписчиков
-- `upsert_object(listing)` / `get_latest_snapshot(inner_code)` / `save_snapshot()`
-- `update_crawler_state()` / `get_daily_stats()`
+- `upsert_object(listing, *, autocommit=True)` — обновляет slug и url
+- `save_snapshot(inner_code, listing, *, autocommit=True)`
+- `get_latest_snapshot(inner_code)`
+- `get_region_objects(region_guid)` → все ЖК с последним снимком, сортировка по available DESC
+- `cleanup_old_snapshots(days=90)` → вызывается из run_daily.py
+- `begin_transaction()` / `commit()` / `rollback()` — для батч-операций
+- `update_crawler_state()` / `update_daily_stats()` / `get_daily_stats()`
+- `get_daily_history(days=30)` → история из crawler_daily_stats
+
+**Соединение:** `threading.local()` — per-thread, WAL mode, foreign_keys=ON.
+
+**Миграция:** `_migrate_schema()` автоматически пересоздаёт `object_snapshots` если `price` имеет тип TEXT (для существующих БД до рефакторинга).
+
+**Формат дат:** везде `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')` — UTC с суффиксом Z.
 
 **Настройки:** `PRAGMA journal_mode=WAL` — параллельные чтения.
 
@@ -132,7 +175,7 @@ venv/bin/python run_crawler.py          # тест краулера
 | `ImprovedRoughCount` | `improved_rough` | Улучшенная черновая |
 | `PreFinishingCount` | `pre_finish` | Предчистовая |
 | `FinishingCount` | `finish` | Чистовая |
-| `Price` | `price` | Цена за м² |
+| `Price` | `price` | Цена за м² — хранится как INTEGER (парсится через `_parse_price`) |
 | `Builder` | `builder` | Застройщик |
 | `ProgramName` | `program` | Наурыз, Отау и др. |
 | `RpsStatusDate` | `publish_date` | Дата публикации |
@@ -157,16 +200,19 @@ is_valid_region(guid) → bool
 
 FastAPI приложение. Отвечает Telegram мгновенно (200 OK), обработка в `BackgroundTasks`.
 
+Использует `tg` из `telegram_api.py` через тонкие обёртки `_send`, `_edit`, `_answer_callback`, `_answer_precheckout`, `_send_invoice`.
+
 **Команды пользователя:**
 - `/start` — приветствие + главное меню
+- `/objects` — выбор региона → список ЖК (бесплатно, из БД)
 - `/my` / `/subscriptions` — активные подписки с кнопками отписки
 - `/help` — справка
 
 **Команды администратора** (только `is_admin=1`):
 - `/admin` — статистика: пользователи, подписки, краулер за сегодня
-- `/broadcast <текст>` — рассылка всем активным подписчикам
-- `/addadmin <user_id>` — назначить администратора
-- `/run` — запустить краулер по всем регионам немедленно
+- `/broadcast <текст>` — рассылка всем активным подписчикам (в отдельном потоке)
+- `/addadmin <user_id>` — назначить администратора (проверяет существование в БД)
+- `/run` — запустить краулер немедленно (в отдельном потоке, защита от двойного запуска через `_crawler_lock`)
 
 **Telegram Stars (подписка):**
 - `sendInvoice(currency="XTR", provider_token="")` — инвойс в Stars
@@ -174,25 +220,37 @@ FastAPI приложение. Отвечает Telegram мгновенно (200 
 - `successful_payment.invoice_payload` = `"sub:{region_guid}"` → `activate_subscription()`
 
 **callback_data формат:**
-- `menu:main` / `menu:regions` / `menu:my` / `menu:help`
+- `menu:main` / `menu:regions` / `menu:my` / `menu:help` / `menu:objects`
 - `subscribe:{guid}` → показать карточку региона с ценой
 - `pay:{guid}` → отправить Stars-инвойс
 - `unsub:{guid}` → запросить подтверждение
 - `unsub_confirm:{guid}` → отписаться
-- `regions_page:{n}` → постраничная навигация по регионам
+- `sub_info:{guid}` → тост с датой истечения (answerCallbackQuery с текстом)
+- `regions_page:{n}` → постраничная навигация (подписки)
+- `objects_region:{guid}` → показать список ЖК региона
+- `objects_page:{n}` → постраничная навигация (объекты)
+
+**`_kb_regions_page`** принимает `item_prefix`, `page_prefix`, `back_callback` — переиспользуется для flow подписки и просмотра объектов.
+
+**Безопасность:**
+- Все данные из БД в HTML-сообщениях экранируются через `html.escape()`
+- `is_valid_region(guid)` проверяется во всех callback-обработчиках с guid
+- `user_id` и `msg_id` проверяются на None в начале `_handle_callback`
+- Номер страницы парсится с `try/except (ValueError, IndexError)`
 
 ---
 
 ## notifier.py
 
-Telegram Bot API. Правило: ≤ 10 объектов → отдельное сообщение на каждый, > 10 → одно сводное.
+Отправка сообщений через `tg` из `telegram_api.py`. Правило: ≤ 10 объектов → отдельное сообщение на каждый, > 10 → одно сводное.
 
-**Функции:**
+**Публичные функции:**
+- `send_message(text, chat_id, parse_mode="HTML")` → bool — для broadcast и уведомлений администратора
 - `send_new_listings(listings, chat_id)` — новые объекты
 - `send_changed_listings(changed, chat_id)` — изменения доступности
-- `send_subscription_activated(chat_id, region_name, paid_until)` — подтверждение оплаты
-- `send_subscription_expiring(chat_id, region_name, paid_until, days_left)` — предупреждение
-- `send_daily_report(runs, new, changed, total, chat_id)` — ежедневная сводка
+- `send_subscription_activated(chat_id, region_name, paid_until)`
+- `send_subscription_expiring(chat_id, region_name, paid_until, days_left)`
+- `send_daily_report(runs, new, changed, total, chat_id)`
 
 ---
 
@@ -225,14 +283,27 @@ Cron на VPS (Ubuntu, UTC по умолчанию):
 
 ## Правила при изменении кода
 
-**Перед добавлением новых SQL-запросов:**
-- Проверить наличие индексов для WHERE-условий (есть: `idx_snapshots_inner_code`, `idx_subscriptions_region`, `idx_objects_region`)
-- При частых запросах — добавить индекс в `_init_schema()`
+**Telegram API вызовы:**
+- Все новые вызовы — только через `TelegramAPI` в `telegram_api.py`
+- Не использовать `requests` напрямую в `bot.py` или `notifier.py`
+- Лимит рассылки: 30 сообщений/сек глобально → `time.sleep(0.05)` между отправками
 
-**При изменении схемы БД:**
+**Транзакции в storage.py:**
+- Одиночные операции: `upsert_object(listing)` — коммитит сам (autocommit=True по умолчанию)
+- Батч (runner.py): передавать `autocommit=False`, вызвать `storage.commit()` в конце, `storage.rollback()` в except
+
+**SQL-запросы:**
+- Проверить индексы для WHERE-условий (есть: `idx_snapshots_inner_code`, `idx_subscriptions_active`, `idx_subscriptions_expiring`, `idx_objects_region`)
+- Для получения последнего снимка использовать CTE: `WITH latest AS (SELECT inner_code, MAX(id) FROM object_snapshots GROUP BY inner_code)` — не коррелированный подзапрос
+
+**Схема БД:**
 - `_init_schema()` использует `CREATE TABLE IF NOT EXISTS` — не ломает существующую БД
-- Для добавления колонок в существующую БД нужен отдельный `ALTER TABLE`
+- Для изменения типа колонки или добавления FK — добавить миграцию в `_migrate_schema()`
+- Новые колонки в существующие таблицы — через `ALTER TABLE` в `_migrate_schema()`
 
-**При добавлении Telegram API вызовов:**
-- Telegram лимит рассылки: 30 сообщений/сек глобально, 1 сообщение/сек на один чат
-- При большом количестве подписчиков добавить `time.sleep(0.05)` между отправками в `runner.py`
+**HTML в сообщениях:**
+- Любые данные из БД или от пользователя экранировать через `html.escape()` перед подстановкой в HTML-строки
+
+**Параллельные запуски:**
+- `run_crawler.py` защищён `fcntl.flock` — второй процесс завершается с exit(0)
+- `/run` в боте защищён `_crawler_lock = threading.Lock()`

@@ -45,6 +45,9 @@ def _notify_expiring_subscriptions() -> None:
 
 
 def main() -> None:
+    # Очистка старых снимков
+    storage.cleanup_old_snapshots(days=90)
+
     # Отчёт администратору
     stats = storage.get_daily_stats()
     if config.ADMIN_USER_ID:

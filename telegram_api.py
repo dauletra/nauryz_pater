@@ -1,0 +1,87 @@
+import logging
+
+import requests
+
+import config
+
+logger = logging.getLogger(__name__)
+
+
+class TelegramAPI:
+    """Единая точка доступа к Telegram Bot API: логирование ошибок, таймауты."""
+
+    def __init__(self, token: str) -> None:
+        if not token:
+            logger.warning("TELEGRAM_TOKEN не задан — все API-вызовы будут падать")
+        self._base = f"https://api.telegram.org/bot{token}"
+        self._session = requests.Session()
+
+    def _call(self, method: str, payload: dict) -> dict:
+        # Убираем None-значения чтобы не слать лишние поля
+        body = {k: v for k, v in payload.items() if v is not None}
+        try:
+            resp = self._session.post(
+                f"{self._base}/{method}",
+                json=body,
+                timeout=10,
+            )
+            data = resp.json()
+            if not data.get("ok"):
+                logger.error(
+                    "Telegram %s [%d] → %s",
+                    method, resp.status_code, data.get("description", data),
+                )
+            return data
+        except Exception as e:
+            logger.error("Telegram %s exception: %s", method, e)
+            return {"ok": False}
+
+    def send_message(self, chat_id: int | str, text: str,
+                     parse_mode: str = "HTML", **kwargs) -> bool:
+        result = self._call("sendMessage", {
+            "chat_id": chat_id, "text": text, "parse_mode": parse_mode, **kwargs,
+        })
+        return result.get("ok", False)
+
+    def edit_message_text(self, chat_id: int | str, message_id: int, text: str,
+                          parse_mode: str = "HTML", reply_markup=None) -> bool:
+        result = self._call("editMessageText", {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": parse_mode,
+            "reply_markup": reply_markup,
+        })
+        return result.get("ok", False)
+
+    def answer_callback_query(self, callback_query_id: str, text: str = "") -> bool:
+        result = self._call("answerCallbackQuery", {
+            "callback_query_id": callback_query_id,
+            "text": text,
+        })
+        return result.get("ok", False)
+
+    def answer_pre_checkout_query(self, pre_checkout_query_id: str,
+                                  ok: bool, error_message: str = "") -> bool:
+        payload: dict = {"pre_checkout_query_id": pre_checkout_query_id, "ok": ok}
+        if not ok and error_message:
+            payload["error_message"] = error_message
+        result = self._call("answerPreCheckoutQuery", payload)
+        return result.get("ok", False)
+
+    def send_invoice(self, chat_id: int | str, title: str, description: str,
+                     payload: str, currency: str, prices: list,
+                     provider_token: str = "") -> bool:
+        result = self._call("sendInvoice", {
+            "chat_id":        chat_id,
+            "title":          title,
+            "description":    description,
+            "payload":        payload,
+            "currency":       currency,
+            "prices":         prices,
+            "provider_token": provider_token,
+        })
+        return result.get("ok", False)
+
+
+tg = TelegramAPI(config.TELEGRAM_TOKEN)

@@ -15,10 +15,45 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_LOCK_PATH = "/tmp/otbasy_crawler.lock"
+
+try:
+    import fcntl
+    _HAS_FCNTL = True
+except ImportError:
+    _HAS_FCNTL = False  # Windows — блокировка недоступна
+
+
+def _acquire_lock():
+    """Возвращает файловый дескриптор если блокировка получена, иначе None."""
+    if not _HAS_FCNTL:
+        return object()  # заглушка — на Windows блокировка не нужна
+    try:
+        fd = open(_LOCK_PATH, "w")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except BlockingIOError:
+        return None
+
+
+def _release_lock(fd) -> None:
+    if not _HAS_FCNTL or not hasattr(fd, "fileno"):
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
+    except Exception:
+        pass
+
 
 def main() -> None:
-    logger.info("=== OtbasyCrawler старт ===")
+    lock = _acquire_lock()
+    if lock is None:
+        logger.warning("Краулер уже запущен (lock занят), пропускаю запуск.")
+        sys.exit(0)
+
     try:
+        logger.info("=== OtbasyCrawler старт ===")
         result = runner.run_all_regions()
         logger.info(
             "=== Завершён: новых=%d изменений=%d всего=%d ===",
@@ -27,6 +62,8 @@ def main() -> None:
     except Exception as e:
         logger.error("Критическая ошибка краулера: %s", e, exc_info=True)
         sys.exit(1)
+    finally:
+        _release_lock(lock)
 
 
 if __name__ == "__main__":

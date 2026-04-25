@@ -86,6 +86,14 @@ def _fetch_page(session: requests.Session, csrf: str | None,
     return []
 
 
+def _parse_price(raw_price) -> int:
+    s = str(raw_price or "").replace(" ", "").replace(",", "").replace("\xa0", "")
+    try:
+        return int(float(s)) if s else 0
+    except ValueError:
+        return 0
+
+
 def _normalize_card(raw: dict, region_guid: str) -> dict:
     inner_code = str(raw.get("InnerCode", ""))
     slug       = raw.get("Slug", "")
@@ -96,7 +104,7 @@ def _normalize_card(raw: dict, region_guid: str) -> dict:
         "region_guid":    region_guid,
         "name":           raw.get("District", ""),
         "address":        raw.get("Adress", ""),  # опечатка в API
-        "price":          raw.get("Price", ""),
+        "price":          _parse_price(raw.get("Price", "")),
         "available":      raw.get("AprCount", None),
         "rough":          raw.get("RoughCount", 0),
         "improved_rough": raw.get("ImprovedRoughCount", 0),
