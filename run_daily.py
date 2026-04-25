@@ -24,15 +24,11 @@ def _notify_window(now: datetime, days_from: int, days_to: int) -> None:
     from_str = (now + timedelta(days=days_from)).isoformat()
     to_str   = (now + timedelta(days=days_to)).isoformat()
 
-    rows = storage._db().execute(
-        """SELECT user_id, region_guid, paid_until FROM subscriptions
-           WHERE paid_until > ? AND paid_until <= ?""",
-        (from_str, to_str),
-    ).fetchall()
+    rows = storage.get_expiring_subscriptions(from_str, to_str)
 
     for row in rows:
         try:
-            until_dt  = datetime.fromisoformat(row["paid_until"])
+            until_dt  = datetime.fromisoformat(row["paid_until"].replace("Z", "+00:00"))
             days_left = max(0, (until_dt - now).days)
             notifier.send_subscription_expiring(
                 str(row["user_id"]),
@@ -58,11 +54,7 @@ def _notify_expired_subscriptions() -> None:
     yesterday = (now - timedelta(days=1)).isoformat()
     now_str   = now.isoformat()
 
-    rows = storage._db().execute(
-        """SELECT user_id, region_guid FROM subscriptions
-           WHERE paid_until > ? AND paid_until <= ?""",
-        (yesterday, now_str),
-    ).fetchall()
+    rows = storage.get_recently_expired_subscriptions(yesterday, now_str)
 
     for row in rows:
         try:
@@ -75,10 +67,30 @@ def _notify_expired_subscriptions() -> None:
             logger.error("Ошибка win-back уведомления: %s", e)
 
 
+def _send_weekly_signals() -> None:
+    """Еженедельный сигнал подписчикам, у которых не было уведомлений 7 дней."""
+    subs = storage.get_subscriptions_needing_weekly_signal(days=7)
+    if not subs:
+        return
+    logger.info("Еженедельный сигнал: %d подписок", len(subs))
+    for sub in subs:
+        try:
+            notifier.send_weekly_signal(
+                str(sub["user_id"]),
+                regions.get_region_name(sub["region_guid"]),
+                sub["region_guid"],
+            )
+            storage.mark_weekly_signal_sent(sub["user_id"], sub["region_guid"])
+        except Exception as e:
+            logger.error("Ошибка еженедельного сигнала user=%s region=%s: %s",
+                         sub["user_id"], sub["region_guid"], e)
+
+
 def main() -> None:
     # Очистка старых снимков и давно истёкших подписок (история в payments не трогается)
     storage.cleanup_old_snapshots(days=90)
     storage.cleanup_expired_subscriptions(days=90)
+    storage.cleanup_old_notifications(days=7)
 
     # Отчёт администратору
     stats = storage.get_daily_stats()
@@ -94,6 +106,9 @@ def main() -> None:
 
     # Win-back: напомнить тем, у кого истекло вчера
     _notify_expired_subscriptions()
+
+    # Еженедельный сигнал тем, у кого не было уведомлений 7 дней
+    _send_weekly_signals()
 
 
 if __name__ == "__main__":

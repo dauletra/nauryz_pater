@@ -1,7 +1,6 @@
 import logging
 
 import crawler
-import notifier
 import regions
 import storage
 
@@ -53,6 +52,11 @@ def run_region(region_guid: str, region_name: str) -> dict:
                     changed_objects.append(listing)
                     logger.info("[%s] Изменение [%s]: %s", region_name, listing["id"], diffs)
 
+        if new_objects:
+            storage.enqueue_notification(region_guid, "new", new_objects, autocommit=False)
+        if changed_objects:
+            storage.enqueue_notification(region_guid, "changed", changed_objects, autocommit=False)
+
         storage.commit()
     except Exception as e:
         storage.rollback()
@@ -65,18 +69,6 @@ def run_region(region_guid: str, region_name: str) -> dict:
 
     logger.info("[%s] Итого: новых=%d изменений=%d всего=%d",
                 region_name, len(new_objects), len(changed_objects), len(current_listings))
-
-    if new_objects or changed_objects:
-        subscribers = storage.get_region_subscribers(region_guid)
-        if subscribers:
-            logger.info("[%s] Уведомляю %d подписчиков", region_name, len(subscribers))
-            for user_id in subscribers:
-                if new_objects:
-                    notifier.send_new_listings(new_objects, chat_id=str(user_id),
-                                               region_guid=region_guid)
-                if changed_objects:
-                    notifier.send_changed_listings(changed_objects, chat_id=str(user_id),
-                                                   region_guid=region_guid)
 
     return {
         "new":     len(new_objects),

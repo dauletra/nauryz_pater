@@ -1,3 +1,4 @@
+import json
 import logging
 import sqlite3
 import threading
@@ -123,6 +124,20 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             ON subscriptions(paid_until);
         CREATE INDEX IF NOT EXISTS idx_payments_user
             ON payments(user_id, paid_at);
+
+        CREATE TABLE IF NOT EXISTS notification_queue (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            region_guid  TEXT    NOT NULL,
+            event_type   TEXT    NOT NULL CHECK(event_type IN ('new', 'changed')),
+            payload_json TEXT    NOT NULL,
+            created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            sent_at      TEXT,
+            status       TEXT    NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending', 'sent', 'failed'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_nqueue_status
+            ON notification_queue(status, created_at);
     """)
     conn.commit()
 
@@ -176,6 +191,13 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE subscriptions ADD COLUMN cancelled_at TEXT")
         conn.commit()
         logger.info("Миграция: добавлена колонка subscriptions.cancelled_at")
+
+    # Миграция 3: subscriptions.weekly_signal_at
+    sub_cols = {row[1] for row in conn.execute("PRAGMA table_info(subscriptions)").fetchall()}
+    if "weekly_signal_at" not in sub_cols:
+        conn.execute("ALTER TABLE subscriptions ADD COLUMN weekly_signal_at TEXT")
+        conn.commit()
+        logger.info("Миграция: добавлена колонка subscriptions.weekly_signal_at")
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +355,41 @@ def get_region_subscribers(region_guid: str) -> list[int]:
         (region_guid,),
     ).fetchall()
     return [r["user_id"] for r in rows]
+
+
+def get_subscriptions_needing_weekly_signal(days: int = 7) -> list[dict]:
+    """Вернуть (user_id, region_guid) для активных подписок, которым нужен еженедельный сигнал.
+
+    Условия:
+    - подписка активна (paid_until > now)
+    - за последние days дней не было sent-уведомлений по этому региону
+    - еженедельный сигнал не отправлялся последние days дней (или не отправлялся никогда)
+    """
+    rows = _db().execute(
+        """SELECT s.user_id, s.region_guid
+           FROM subscriptions s
+           WHERE s.paid_until > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             AND (s.weekly_signal_at IS NULL
+                  OR s.weekly_signal_at < datetime('now', ?))
+             AND NOT EXISTS (
+                 SELECT 1 FROM notification_queue nq
+                 WHERE nq.region_guid = s.region_guid
+                   AND nq.status = 'sent'
+                   AND nq.sent_at > datetime('now', ?)
+             )""",
+        (f"-{days} days", f"-{days} days"),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_weekly_signal_sent(user_id: int, region_guid: str) -> None:
+    _db().execute(
+        """UPDATE subscriptions
+           SET weekly_signal_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+           WHERE user_id = ? AND region_guid = ?""",
+        (user_id, region_guid),
+    )
+    _db().commit()
 
 
 def get_active_subscriptions_count() -> int:
@@ -686,3 +743,100 @@ def get_daily_history(days: int = 30) -> list[dict]:
         (f"-{days} days",),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Notification queue
+# ---------------------------------------------------------------------------
+
+def enqueue_notification(
+    region_guid: str,
+    event_type: str,
+    listings: list[dict],
+    *,
+    autocommit: bool = True,
+) -> None:
+    _db().execute(
+        "INSERT INTO notification_queue (region_guid, event_type, payload_json) VALUES (?, ?, ?)",
+        (region_guid, event_type, json.dumps(listings, ensure_ascii=False)),
+    )
+    if autocommit:
+        _db().commit()
+
+
+def get_pending_notifications(limit: int = 100) -> list[dict]:
+    """Return pending + failed events ordered by id (FIFO). Failed rows are retried."""
+    rows = _db().execute(
+        """SELECT id, region_guid, event_type, payload_json, created_at
+           FROM notification_queue
+           WHERE status IN ('pending', 'failed')
+           ORDER BY id
+           LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["listings"] = json.loads(item.pop("payload_json"))
+        result.append(item)
+    return result
+
+
+def mark_notification_sent(notification_id: int) -> None:
+    _db().execute(
+        """UPDATE notification_queue
+           SET status = 'sent', sent_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+           WHERE id = ?""",
+        (notification_id,),
+    )
+    _db().commit()
+
+
+def mark_notification_failed(notification_id: int) -> None:
+    _db().execute(
+        "UPDATE notification_queue SET status = 'failed' WHERE id = ?",
+        (notification_id,),
+    )
+    _db().commit()
+
+
+def ping() -> bool:
+    """Return True if the DB connection is healthy."""
+    try:
+        _db().execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+
+def get_expiring_subscriptions(from_str: str, to_str: str) -> list[dict]:
+    """Return subscriptions with paid_until in (from_str, to_str] (UTC ISO strings)."""
+    rows = _db().execute(
+        """SELECT user_id, region_guid, paid_until FROM subscriptions
+           WHERE paid_until > ? AND paid_until <= ?""",
+        (from_str, to_str),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_recently_expired_subscriptions(since_str: str, until_str: str) -> list[dict]:
+    """Return subscriptions that expired between since_str and until_str (UTC ISO strings)."""
+    rows = _db().execute(
+        """SELECT user_id, region_guid FROM subscriptions
+           WHERE paid_until > ? AND paid_until <= ?""",
+        (since_str, until_str),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def cleanup_old_notifications(days: int = 7) -> int:
+    """Delete sent notification_queue rows older than `days` days."""
+    cur = _db().execute(
+        "DELETE FROM notification_queue WHERE status = 'sent' AND created_at < datetime('now', ?)",
+        (f"-{days} days",),
+    )
+    _db().commit()
+    deleted = cur.rowcount
+    if deleted:
+        logger.info("Очистка очереди уведомлений: удалено %d строк старше %d дней", deleted, days)
+    return deleted

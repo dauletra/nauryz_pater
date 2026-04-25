@@ -199,6 +199,16 @@ def send_subscription_expired(chat_id: str, region_name: str, region_guid: str) 
     )
 
 
+def send_weekly_signal(chat_id: str, region_name: str, region_guid: str) -> bool:
+    return _send_message(
+        f"📡 <b>Слежу за {region_name}</b>\n\n"
+        f"За последние 7 дней новых квартир не появлялось.\n"
+        f"Как только что-то изменится — сразу сообщу.",
+        chat_id=chat_id,
+        reply_markup=_region_kb(region_guid),
+    )
+
+
 def send_daily_report(runs: int, new: int, changed: int, total: int,
                       chat_id: str | None = None) -> None:
     _send_message(

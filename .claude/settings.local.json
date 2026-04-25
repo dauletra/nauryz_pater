@@ -41,7 +41,9 @@
       "Bash(curl -s \"https://baspana.otbasybank.kz/Pool/GetObjects\")",
       "Bash(curl -s -X GET \"https://baspana.otbasybank.kz/api/regions\")",
       "Bash(del \"C:\\\\Users\\\\Daulet-asus\\\\PycharmProjects\\\\OtbasyCrawler\\\\functions\\\\main.py\")",
-      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\Daulet-asus\\\\PycharmProjects\\\\OtbasyCrawler\" | Where-Object { $_.Name -ne '.venv' } | Select-Object Name)"
+      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\Daulet-asus\\\\PycharmProjects\\\\OtbasyCrawler\" | Where-Object { $_.Name -ne '.venv' } | Select-Object Name)",
+      "Bash(python -m py_compile bot.py storage.py telegram_api.py crawler.py run_daily.py run_notifier.py runner.py)",
+      "Bash(python -m py_compile storage.py notifier.py run_daily.py)"
     ]
   }
 }

@@ -1,4 +1,5 @@
 import logging
+import time
 
 import requests
 
@@ -17,24 +18,38 @@ class TelegramAPI:
         self._session = requests.Session()
 
     def _call(self, method: str, payload: dict) -> dict:
-        # Убираем None-значения чтобы не слать лишние поля
         body = {k: v for k, v in payload.items() if v is not None}
-        try:
-            resp = self._session.post(
-                f"{self._base}/{method}",
-                json=body,
-                timeout=10,
-            )
-            data = resp.json()
-            if not data.get("ok"):
-                logger.error(
-                    "Telegram %s [%d] → %s",
-                    method, resp.status_code, data.get("description", data),
+        delay = 1.0
+        for attempt in range(3):
+            try:
+                resp = self._session.post(
+                    f"{self._base}/{method}",
+                    json=body,
+                    timeout=10,
                 )
-            return data
-        except Exception as e:
-            logger.error("Telegram %s exception: %s", method, e)
-            return {"ok": False}
+                data = resp.json()
+                if data.get("ok"):
+                    return data
+                # 429 (rate limit) и 5xx — повторяем
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                    retry_after = data.get("parameters", {}).get("retry_after", delay)
+                    logger.warning("Telegram %s [%d] → retry %d/3 after %.1fs",
+                                   method, resp.status_code, attempt + 1, retry_after)
+                    time.sleep(retry_after)
+                    delay *= 2
+                    continue
+                logger.error("Telegram %s [%d] → %s",
+                             method, resp.status_code, data.get("description", data))
+                return data
+            except Exception as e:
+                if attempt < 2:
+                    logger.warning("Telegram %s exception (retry %d/3): %s", method, attempt + 1, e)
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                logger.error("Telegram %s exception: %s", method, e)
+                return {"ok": False}
+        return {"ok": False}
 
     def send_message(self, chat_id: int | str, text: str,
                      parse_mode: str = "HTML", **kwargs) -> bool:

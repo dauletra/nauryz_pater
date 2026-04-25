@@ -17,6 +17,11 @@ from telegram_api import tg
 _crawler_lock = threading.Lock()
 
 logger = logging.getLogger(__name__)
+
+
+def _iso_to_aware(s: str) -> datetime:
+    """Parse stored UTC date string to aware datetime (handles trailing Z)."""
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -193,8 +198,7 @@ def _format_objects_message(region_name: str, objects: list[dict]) -> str:
     timestamps = [o["timestamp"] for o in objects if o.get("timestamp")]
     if timestamps:
         try:
-            last_ts  = max(datetime.fromisoformat(t) for t in timestamps)
-            last_ts  = last_ts.replace(tzinfo=timezone.utc)
+            last_ts  = max(_iso_to_aware(t) for t in timestamps)
             almaty   = last_ts + timedelta(hours=5)
             time_str = almaty.strftime("%d.%m %H:%M")
         except Exception:
@@ -397,6 +401,250 @@ def _handle_add_admin(actor_id: int, args: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Callback sub-handlers  (user_id, msg_id, cq_id, suffix)
+# ---------------------------------------------------------------------------
+
+def _cb_menu_main(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    _edit(user_id, msg_id, "Главное меню:", reply_markup=_kb_main_menu())
+
+
+def _cb_menu_my(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    subs = storage.get_user_subscriptions(user_id)
+    if not subs:
+        _edit(user_id, msg_id,
+              "📭 У вас нет активных подписок.\n\nВыберите регион:",
+              reply_markup=_kb_regions_page())
+    else:
+        _edit(user_id, msg_id,
+              f"📋 <b>Ваши активные подписки ({len(subs)}):</b>",
+              reply_markup=_kb_my_subscriptions(subs))
+
+
+def _cb_menu_objects(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    _edit(user_id, msg_id,
+          "📦 <b>Объекты на Baspana</b>\n\nВыберите регион:",
+          reply_markup=_kb_regions_page(
+              item_prefix="objects_region",
+              page_prefix="objects_page",
+              back_callback="menu:main",
+          ))
+
+
+def _cb_menu_help(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    _edit(user_id, msg_id,
+          "<b>OtbasyCrawler — помощь</b>\n\n"
+          "Бот отслеживает новые квартиры на baspana.otbasybank.kz.\n\n"
+          f"💫 <b>Подписка:</b> {config.STARS_PRICE} Stars "
+          f"за регион на {config.SUBSCRIPTION_DAYS} дней\n"
+          "Оплата через встроенную систему Telegram.\n"
+          "Можно подписаться на несколько регионов.",
+          reply_markup=_kb_back_to_menu())
+
+
+_MENU_SUB: dict = {}  # заполняется после объявления функций
+
+
+def _cb_menu(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    h = _MENU_SUB.get(suffix)
+    if h:
+        h(user_id, msg_id, cq_id, suffix)
+    else:
+        logger.warning("Неизвестный menu sub-command: %s", suffix)
+
+
+def _cb_objects_page(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    try:
+        page = int(suffix)
+    except (ValueError, TypeError):
+        page = 0
+    _edit(user_id, msg_id,
+          "📦 <b>Объекты на Baspana</b>\n\nВыберите регион:",
+          reply_markup=_kb_regions_page(
+              page=page,
+              item_prefix="objects_region",
+              page_prefix="objects_page",
+              back_callback="menu:main",
+          ))
+
+
+def _cb_objects_region(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    if not regions.is_valid_region(suffix):
+        logger.warning("Недействительный region_guid в objects_region: %s", suffix)
+        return
+    _show_region_objects(user_id, msg_id, suffix)
+
+
+def _cb_subscribe(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    region_guid = suffix
+    if not regions.is_valid_region(region_guid):
+        logger.warning("Недействительный region_guid в subscribe: %s", region_guid)
+        return
+    region_name = regions.get_region_name(region_guid)
+    subs = storage.get_user_subscriptions(user_id)
+    sub  = next((s for s in subs if s["region_guid"] == region_guid), None)
+    if sub and not sub.get("cancelled_at"):
+        _edit(user_id, msg_id,
+              f"✅ У вас уже есть подписка на <b>{html.escape(region_name)}</b>.",
+              reply_markup=_kb_manage_sub(region_guid))
+    else:
+        objects   = storage.get_region_objects(region_guid)
+        available = sum(1 for o in objects if o.get("available"))
+        total     = len(objects)
+        live_str  = (f"Сейчас доступно квартир: <b>{available} ЖК из {total}</b>\n\n"
+                     if total else "")
+        _edit(user_id, msg_id,
+              f"📍 <b>{html.escape(region_name)}</b>\n\n"
+              f"{live_str}"
+              f"Подписка даёт мгновенные уведомления — вы узнаете о новых объектах "
+              f"и изменениях доступности раньше всех.\n\n"
+              f"💫 <b>{config.STARS_PRICE} Stars</b>  ·  {config.SUBSCRIPTION_DAYS} дней",
+              reply_markup=_kb_confirm_subscribe(region_guid, region_name))
+
+
+def _cb_pay(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    region_guid = suffix
+    if not regions.is_valid_region(region_guid):
+        logger.warning("Недействительный region_guid в pay: %s", region_guid)
+        return
+    _send_invoice(user_id, region_guid, regions.get_region_name(region_guid))
+
+
+def _cb_manage_sub(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    region_guid = suffix
+    if not regions.is_valid_region(region_guid):
+        logger.warning("Недействительный region_guid в manage_sub: %s", region_guid)
+        return
+    region_name = regions.get_region_name(region_guid)
+    subs = storage.get_user_subscriptions(user_id)
+    sub  = next((s for s in subs if s["region_guid"] == region_guid), None)
+    if not sub:
+        _edit(user_id, msg_id,
+              f"Подписка на <b>{html.escape(region_name)}</b> не найдена или истекла.",
+              reply_markup=_kb_back_to_menu())
+        return
+    try:
+        until_dt  = _iso_to_aware(sub["paid_until"])
+        until_str = until_dt.strftime("%d.%m.%Y")
+        days_left = max(0, (until_dt - datetime.now(timezone.utc)).days)
+    except Exception:
+        until_str = sub["paid_until"][:10]
+        days_left = 0
+    if sub.get("cancelled_at"):
+        _edit(user_id, msg_id,
+              f"📍 <b>{html.escape(region_name)}</b>\n"
+              f"🔕 Подписка отменена · уведомления до <b>{until_str}</b>"
+              f" (осталось {days_left} дн.)\n\n"
+              f"Возобновление добавит {config.SUBSCRIPTION_DAYS} дней к текущей дате истечения.",
+              reply_markup=_kb_manage_sub_cancelled(region_guid))
+    else:
+        _edit(user_id, msg_id,
+              f"📍 <b>{html.escape(region_name)}</b>\n"
+              f"📅 Активна до: <b>{until_str}</b>  (осталось {days_left} дн.)\n\n"
+              f"Продление добавит {config.SUBSCRIPTION_DAYS} дней к текущей дате истечения.",
+              reply_markup=_kb_manage_sub(region_guid))
+
+
+def _cb_sub_info(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    region_guid = suffix
+    if not regions.is_valid_region(region_guid):
+        _answer_callback(cq_id)
+        return
+    region_name = regions.get_region_name(region_guid)
+    subs = storage.get_user_subscriptions(user_id)
+    sub  = next((s for s in subs if s["region_guid"] == region_guid), None)
+    if sub:
+        try:
+            until = _iso_to_aware(sub["paid_until"]).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            until = sub["paid_until"]
+        _answer_callback(cq_id, f"{region_name}: активна до {until}")
+    else:
+        _answer_callback(cq_id)
+
+
+def _cb_unsub(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    region_guid = suffix
+    if not regions.is_valid_region(region_guid):
+        logger.warning("Недействительный region_guid в unsub: %s", region_guid)
+        return
+    region_name = regions.get_region_name(region_guid)
+    subs = storage.get_user_subscriptions(user_id)
+    sub  = next((s for s in subs if s["region_guid"] == region_guid), None)
+    try:
+        until_str = _iso_to_aware(sub["paid_until"]).strftime("%d.%m.%Y") if sub else "—"
+    except Exception:
+        until_str = "—"
+    _edit(user_id, msg_id,
+          f"❓ Отписаться от <b>{html.escape(region_name)}</b>?\n\n"
+          f"Вы оплатили подписку до <b>{until_str}</b> — вы можете продолжать "
+          f"получать уведомления до конца срока без дополнительной оплаты.",
+          reply_markup=_kb_confirm_unsub(region_guid, until_str))
+
+
+def _cb_unsub_soft(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    region_guid = suffix
+    if not regions.is_valid_region(region_guid):
+        logger.warning("Недействительный region_guid в unsub_soft: %s", region_guid)
+        return
+    region_name = regions.get_region_name(region_guid)
+    subs = storage.get_user_subscriptions(user_id)
+    sub  = next((s for s in subs if s["region_guid"] == region_guid), None)
+    try:
+        until_str = _iso_to_aware(sub["paid_until"]).strftime("%d.%m.%Y") if sub else "—"
+    except Exception:
+        until_str = "—"
+    storage.deactivate_subscription(user_id, region_guid, immediate=False)
+    _edit(user_id, msg_id,
+          f"🔔 Подписка на <b>{html.escape(region_name)}</b> отменена.\n\n"
+          f"Уведомления продолжаются до <b>{until_str}</b>.\n"
+          f"После этой даты уведомления прекратятся автоматически.",
+          reply_markup={"inline_keyboard": [
+              [{"text": f"🔄 Возобновить · {config.STARS_PRICE} Stars",
+                "callback_data": f"pay:{region_guid}"}],
+              [{"text": "🔙 Главное меню", "callback_data": "menu:main"}],
+          ]})
+
+
+def _cb_unsub_confirm(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    region_guid = suffix
+    if not regions.is_valid_region(region_guid):
+        logger.warning("Недействительный region_guid в unsub_confirm: %s", region_guid)
+        return
+    region_name = regions.get_region_name(region_guid)
+    storage.deactivate_subscription(user_id, region_guid)
+    _edit(user_id, msg_id,
+          f"Вы отписались от <b>{html.escape(region_name)}</b>.",
+          reply_markup={"inline_keyboard": [
+              [{"text": f"↩️ Подписаться снова · {config.STARS_PRICE} Stars",
+                "callback_data": f"subscribe:{region_guid}"}],
+              [{"text": "🔙 Главное меню", "callback_data": "menu:main"}],
+          ]})
+
+
+_MENU_SUB.update({
+    "main":    _cb_menu_main,
+    "my":      _cb_menu_my,
+    "objects": _cb_menu_objects,
+    "help":    _cb_menu_help,
+    "regions": lambda u, m, c, s: _cb_objects_page(u, m, c, "0"),
+})
+
+_CB_HANDLERS: dict = {
+    "menu":           _cb_menu,
+    "objects_page":   _cb_objects_page,
+    "regions_page":   _cb_objects_page,
+    "objects_region": _cb_objects_region,
+    "subscribe":      _cb_subscribe,
+    "pay":            _cb_pay,
+    "manage_sub":     _cb_manage_sub,
+    "sub_info":       _cb_sub_info,
+    "unsub":          _cb_unsub,
+    "unsub_soft":     _cb_unsub_soft,
+    "unsub_confirm":  _cb_unsub_confirm,
+}
+
+
+# ---------------------------------------------------------------------------
 # Callback query handler
 # ---------------------------------------------------------------------------
 
@@ -412,7 +660,7 @@ def _handle_callback(callback_query: dict) -> None:
         logger.warning("callback_query без user_id или msg_id, пропускаю")
         return
 
-    # sub_info отвечает с текстом — для остальных отвечаем пустым чтобы убрать spinner
+    # sub_info отвечает с текстом — для остальных убираем spinner сразу
     if not data.startswith("sub_info:"):
         _answer_callback(cq_id)
 
@@ -423,222 +671,10 @@ def _handle_callback(callback_query: dict) -> None:
         user.get("last_name"),
     )
 
-    # --- Навигация ---
-    if data == "menu:main":
-        _edit(user_id, msg_id, "Главное меню:", reply_markup=_kb_main_menu())
-
-    elif data == "menu:regions" or data.startswith("regions_page:"):
-        try:
-            page = int(data.split(":")[1]) if data.startswith("regions_page:") else 0
-        except (ValueError, IndexError):
-            page = 0
-        _edit(user_id, msg_id, "🏘 <b>Выберите регион:</b>",
-              reply_markup=_kb_regions_page(
-                  page=page,
-                  item_prefix="objects_region",
-                  page_prefix="objects_page",
-                  back_callback="menu:main",
-              ))
-
-    elif data == "menu:my":
-        subs = storage.get_user_subscriptions(user_id)
-        if not subs:
-            _edit(user_id, msg_id,
-                  "📭 У вас нет активных подписок.\n\nВыберите регион:",
-                  reply_markup=_kb_regions_page())
-        else:
-            _edit(user_id, msg_id,
-                  f"📋 <b>Ваши активные подписки ({len(subs)}):</b>",
-                  reply_markup=_kb_my_subscriptions(subs))
-
-    elif data == "menu:objects":
-        _edit(user_id, msg_id,
-              "📦 <b>Объекты на Baspana</b>\n\nВыберите регион:",
-              reply_markup=_kb_regions_page(
-                  item_prefix="objects_region",
-                  page_prefix="objects_page",
-                  back_callback="menu:main",
-              ))
-
-    elif data.startswith("objects_page:"):
-        try:
-            page = int(data.split(":")[1])
-        except (ValueError, IndexError):
-            page = 0
-        _edit(user_id, msg_id,
-              "📦 <b>Объекты на Baspana</b>\n\nВыберите регион:",
-              reply_markup=_kb_regions_page(
-                  page=page,
-                  item_prefix="objects_region",
-                  page_prefix="objects_page",
-                  back_callback="menu:main",
-              ))
-
-    elif data.startswith("objects_region:"):
-        region_guid = data.split(":", 1)[1]
-        if not regions.is_valid_region(region_guid):
-            logger.warning("Недействительный region_guid в objects_region: %s", region_guid)
-            return
-        _show_region_objects(user_id, msg_id, region_guid)
-
-    elif data == "menu:help":
-        _edit(user_id, msg_id,
-              "<b>OtbasyCrawler — помощь</b>\n\n"
-              "Бот отслеживает новые квартиры на baspana.otbasybank.kz.\n\n"
-              f"💫 <b>Подписка:</b> {config.STARS_PRICE} Stars "
-              f"за регион на {config.SUBSCRIPTION_DAYS} дней\n"
-              "Оплата через встроенную систему Telegram.\n"
-              "Можно подписаться на несколько регионов.",
-              reply_markup=_kb_back_to_menu())
-
-    # --- Подписка ---
-    elif data.startswith("subscribe:"):
-        region_guid = data.split(":", 1)[1]
-        if not regions.is_valid_region(region_guid):
-            logger.warning("Недействительный region_guid в subscribe: %s", region_guid)
-            return
-        region_name = regions.get_region_name(region_guid)
-
-        subs = storage.get_user_subscriptions(user_id)
-        sub  = next((s for s in subs if s["region_guid"] == region_guid), None)
-        if sub and not sub.get("cancelled_at"):
-            _edit(user_id, msg_id,
-                  f"✅ У вас уже есть подписка на <b>{html.escape(region_name)}</b>.",
-                  reply_markup=_kb_manage_sub(region_guid))
-        else:
-            objects = storage.get_region_objects(region_guid)
-            available = sum(1 for o in objects if o.get("available"))
-            total     = len(objects)
-            live_str  = (f"Сейчас доступно квартир: <b>{available} ЖК из {total}</b>\n\n"
-                         if total else "")
-            _edit(
-                user_id, msg_id,
-                f"📍 <b>{html.escape(region_name)}</b>\n\n"
-                f"{live_str}"
-                f"Подписка даёт мгновенные уведомления — вы узнаете о новых объектах "
-                f"и изменениях доступности раньше всех.\n\n"
-                f"💫 <b>{config.STARS_PRICE} Stars</b>  ·  {config.SUBSCRIPTION_DAYS} дней",
-                reply_markup=_kb_confirm_subscribe(region_guid, region_name),
-            )
-
-    elif data.startswith("pay:"):
-        region_guid = data.split(":", 1)[1]
-        if not regions.is_valid_region(region_guid):
-            logger.warning("Недействительный region_guid в pay: %s", region_guid)
-            return
-        region_name = regions.get_region_name(region_guid)
-        _send_invoice(user_id, region_guid, region_name)
-
-    # --- Управление подпиской ---
-    elif data.startswith("manage_sub:"):
-        region_guid = data.split(":", 1)[1]
-        if not regions.is_valid_region(region_guid):
-            logger.warning("Недействительный region_guid в manage_sub: %s", region_guid)
-            return
-        region_name = regions.get_region_name(region_guid)
-        subs = storage.get_user_subscriptions(user_id)
-        sub  = next((s for s in subs if s["region_guid"] == region_guid), None)
-        if not sub:
-            _edit(user_id, msg_id,
-                  f"Подписка на <b>{html.escape(region_name)}</b> не найдена или истекла.",
-                  reply_markup=_kb_back_to_menu())
-            return
-        try:
-            until_dt  = datetime.fromisoformat(sub["paid_until"])
-            until_str = until_dt.strftime("%d.%m.%Y")
-            days_left = max(0, (until_dt - datetime.now(timezone.utc)).days)
-        except Exception:
-            until_str = sub["paid_until"][:10]
-            days_left = 0
-        is_cancelled = bool(sub.get("cancelled_at"))
-        if is_cancelled:
-            _edit(user_id, msg_id,
-                  f"📍 <b>{html.escape(region_name)}</b>\n"
-                  f"🔕 Подписка отменена · уведомления до <b>{until_str}</b>"
-                  f" (осталось {days_left} дн.)\n\n"
-                  f"Возобновление добавит {config.SUBSCRIPTION_DAYS} дней"
-                  f" к текущей дате истечения.",
-                  reply_markup=_kb_manage_sub_cancelled(region_guid))
-        else:
-            _edit(user_id, msg_id,
-                  f"📍 <b>{html.escape(region_name)}</b>\n"
-                  f"📅 Активна до: <b>{until_str}</b>  (осталось {days_left} дн.)\n\n"
-                  f"Продление добавит {config.SUBSCRIPTION_DAYS} дней к текущей дате истечения.",
-                  reply_markup=_kb_manage_sub(region_guid))
-
-    elif data.startswith("sub_info:"):
-        region_guid = data.split(":", 1)[1]
-        if not regions.is_valid_region(region_guid):
-            _answer_callback(cq_id)
-            return
-        region_name = regions.get_region_name(region_guid)
-        subs = storage.get_user_subscriptions(user_id)
-        sub  = next((s for s in subs if s["region_guid"] == region_guid), None)
-        if sub:
-            try:
-                until = datetime.fromisoformat(sub["paid_until"]).strftime("%d.%m.%Y %H:%M")
-            except Exception:
-                until = sub["paid_until"]
-            _answer_callback(cq_id, f"{region_name}: активна до {until}")
-        else:
-            _answer_callback(cq_id)
-
-    elif data.startswith("unsub:"):
-        region_guid = data.split(":", 1)[1]
-        if not regions.is_valid_region(region_guid):
-            logger.warning("Недействительный region_guid в unsub: %s", region_guid)
-            return
-        region_name = regions.get_region_name(region_guid)
-        subs      = storage.get_user_subscriptions(user_id)
-        sub       = next((s for s in subs if s["region_guid"] == region_guid), None)
-        try:
-            until_str = datetime.fromisoformat(sub["paid_until"]).strftime("%d.%m.%Y") if sub else "—"
-        except Exception:
-            until_str = "—"
-        _edit(user_id, msg_id,
-              f"❓ Отписаться от <b>{html.escape(region_name)}</b>?\n\n"
-              f"Вы оплатили подписку до <b>{until_str}</b> — вы можете продолжать "
-              f"получать уведомления до конца срока без дополнительной оплаты.",
-              reply_markup=_kb_confirm_unsub(region_guid, until_str))
-
-    elif data.startswith("unsub_soft:"):
-        region_guid = data.split(":", 1)[1]
-        if not regions.is_valid_region(region_guid):
-            logger.warning("Недействительный region_guid в unsub_soft: %s", region_guid)
-            return
-        region_name = regions.get_region_name(region_guid)
-        subs      = storage.get_user_subscriptions(user_id)
-        sub       = next((s for s in subs if s["region_guid"] == region_guid), None)
-        try:
-            until_str = datetime.fromisoformat(sub["paid_until"]).strftime("%d.%m.%Y") if sub else "—"
-        except Exception:
-            until_str = "—"
-        storage.deactivate_subscription(user_id, region_guid, immediate=False)
-        _edit(user_id, msg_id,
-              f"🔔 Подписка на <b>{html.escape(region_name)}</b> отменена.\n\n"
-              f"Уведомления продолжаются до <b>{until_str}</b>.\n"
-              f"После этой даты уведомления прекратятся автоматически.",
-              reply_markup={"inline_keyboard": [
-                  [{"text": f"🔄 Возобновить · {config.STARS_PRICE} Stars",
-                    "callback_data": f"pay:{region_guid}"}],
-                  [{"text": "🔙 Главное меню", "callback_data": "menu:main"}],
-              ]})
-
-    elif data.startswith("unsub_confirm:"):
-        region_guid = data.split(":", 1)[1]
-        if not regions.is_valid_region(region_guid):
-            logger.warning("Недействительный region_guid в unsub_confirm: %s", region_guid)
-            return
-        region_name = regions.get_region_name(region_guid)
-        storage.deactivate_subscription(user_id, region_guid)
-        _edit(user_id, msg_id,
-              f"Вы отписались от <b>{html.escape(region_name)}</b>.",
-              reply_markup={"inline_keyboard": [
-                  [{"text": f"↩️ Подписаться снова · {config.STARS_PRICE} Stars",
-                    "callback_data": f"subscribe:{region_guid}"}],
-                  [{"text": "🔙 Главное меню", "callback_data": "menu:main"}],
-              ]})
-
+    prefix, _, suffix = data.partition(":")
+    handler = _CB_HANDLERS.get(prefix)
+    if handler:
+        handler(user_id, msg_id, cq_id, suffix)
     else:
         logger.warning("Неизвестный callback_data: %s", data)
 
@@ -829,4 +865,17 @@ async def bot_webhook(request: Request, background_tasks: BackgroundTasks) -> Re
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok"}
+    db_ok = storage.ping()
+
+    crawler_ok = False
+    try:
+        states = storage.get_crawler_states()
+        last_runs = [s["last_run"] for s in states if s.get("last_run")]
+        if last_runs:
+            last_run = _iso_to_aware(max(last_runs))
+            crawler_ok = (datetime.now(timezone.utc) - last_run).total_seconds() < 1800
+    except Exception:
+        pass
+
+    status = "ok" if (db_ok and crawler_ok) else "degraded"
+    return {"status": status, "db": db_ok, "crawler_fresh": crawler_ok}

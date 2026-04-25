@@ -151,7 +151,9 @@ def fetch_all_listings(region_guid: str, region_name: str) -> list[dict]:
                 logger.info("  получено %d объектов", len(objects))
                 all_raw.extend(objects)
             except Exception as e:
-                logger.error("[%s] Ошибка страницы %d: %s", region_name, page_num, e)
+                logger.error("[%s] Ошибка страницы %d, прерываю регион: %s",
+                             region_name, page_num, e)
+                return []
 
     unique = _deduplicate([_normalize_card(c, region_guid) for c in all_raw])
     logger.info("[%s] Итого уникальных объектов: %d", region_name, len(unique))
