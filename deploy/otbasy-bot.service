@@ -1,0 +1,16 @@
+[Unit]
+Description=Otbasy Telegram Bot (webhook)
+After=network.target
+
+[Service]
+User=otbasy
+WorkingDirectory=/opt/otbasy/app
+EnvironmentFile=/opt/otbasy/app/.env
+ExecStart=/opt/otbasy/venv/bin/uvicorn bot:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

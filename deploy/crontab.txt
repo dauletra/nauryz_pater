@@ -1,0 +1,12 @@
+# Crontab для пользователя otbasy
+# Установить командой: crontab -e
+#
+# ВАЖНО: Казахстан UTC+5 (с марта 2024). 20:00 Almaty = 15:00 UTC
+# Если сервер в UTC (стандарт Ubuntu) — использовать строки ниже.
+# Если сервер настроен на Asia/Almaty — заменить "0 15" на "0 20".
+
+# Краулер каждые 10 минут
+*/10 * * * * cd /opt/otbasy/app && /opt/otbasy/venv/bin/python run_crawler.py >> /var/log/otbasy/crawler.log 2>&1
+
+# Ежедневный отчёт в 20:00 Almaty = 15:00 UTC
+0 15 * * * cd /opt/otbasy/app && /opt/otbasy/venv/bin/python run_daily.py >> /var/log/otbasy/daily.log 2>&1

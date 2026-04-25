@@ -1,0 +1,22 @@
+# Секреты — никогда не коммитить!
+.env
+*.env
+
+# SQLite база данных
+data/
+*.db
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Firebase (больше не нужны на VPS, но оставим на случай)
+.firebase/
