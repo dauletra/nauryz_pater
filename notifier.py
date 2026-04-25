@@ -1,3 +1,4 @@
+import html
 import logging
 from datetime import datetime
 
@@ -36,9 +37,9 @@ def _finishing_line(card: dict) -> str:
 def _card_message(card: dict, header: str = "🏠 <b>Новый объект на Baspana!</b>") -> str:
     lines = [header]
     if card.get("name"):
-        lines.append(f"🏗 <b>{card['name']}</b>")
+        lines.append(f"🏗 <b>{html.escape(card['name'])}</b>")
     if card.get("address"):
-        lines.append(f"📍 {card['address']}")
+        lines.append(f"📍 {html.escape(card['address'])}")
     if card.get("price"):
         price_fmt = f"{card['price']:,}".replace(",", " ")
         lines.append(f"💰 от {price_fmt} ₸/м²")
@@ -48,15 +49,15 @@ def _card_message(card: dict, header: str = "🏠 <b>Новый объект н�
     if finishing:
         lines.append(f"🔧 {finishing}")
     if card.get("builder"):
-        lines.append(f"👷 {card['builder']}")
+        lines.append(f"👷 {html.escape(card['builder'])}")
     if card.get("program"):
-        lines.append(f"📋 Программа: {card['program']}")
+        lines.append(f"📋 Программа: {html.escape(card['program'])}")
     if card.get("publish_date"):
         lines.append(f"📅 Опубликовано: {card['publish_date'][:10]}")
     if card.get("code"):
-        lines.append(f"🔑 Код объекта: {card['code']}")
+        lines.append(f"🔑 Код объекта: {html.escape(str(card['code']))}")
     if card.get("url"):
-        lines.append(f'🔗 <a href="{card["url"]}">Открыть на Baspana</a>')
+        lines.append(f'🔗 <a href="{html.escape(card["url"])}">Открыть на Baspana</a>')
     return "\n".join(lines)
 
 
@@ -73,9 +74,9 @@ def _changed_message(card: dict) -> str:
     diffs = card.get("diffs", {})
     lines = ["🔄 <b>Изменение доступности</b>"]
     if card.get("name"):
-        lines.append(f"🏗 <b>{card['name']}</b>")
+        lines.append(f"🏗 <b>{html.escape(card['name'])}</b>")
     if card.get("address"):
-        lines.append(f"📍 {card['address']}")
+        lines.append(f"📍 {html.escape(card['address'])}")
     lines.append("")
     for field, label in _FIELD_LABELS.items():
         if field not in diffs:
@@ -85,9 +86,9 @@ def _changed_message(card: dict) -> str:
         sign = "+" if delta > 0 else ""
         lines.append(f"  {label}: {old} → <b>{new}</b> ({sign}{delta})")
     if card.get("program"):
-        lines.append(f"\n📋 {card['program']}")
+        lines.append(f"\n📋 {html.escape(card['program'])}")
     if card.get("url"):
-        lines.append(f'🔗 <a href="{card["url"]}">Открыть на Baspana</a>')
+        lines.append(f'🔗 <a href="{html.escape(card["url"])}">Открыть на Baspana</a>')
     return "\n".join(lines)
 
 
@@ -97,12 +98,12 @@ def _summary_message(cards: list[dict], label: str = "Новых объекто�
         "",
     ]
     for i, card in enumerate(cards, 1):
-        name      = card.get("name") or card.get("address", "—")
+        name      = html.escape(card.get("name") or card.get("address", "—"))
         available = card.get("available")
         avail_str = f" · {available} кв." if available is not None else ""
         url       = card.get("url", "")
         if url:
-            lines.append(f'{i}. <a href="{url}">{name}</a>{avail_str}')
+            lines.append(f'{i}. <a href="{html.escape(url)}">{name}</a>{avail_str}')
         else:
             lines.append(f"{i}. {name}{avail_str}")
     return "\n".join(lines)

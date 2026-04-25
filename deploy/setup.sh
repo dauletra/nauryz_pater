@@ -65,6 +65,9 @@ certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m admin@"$DOMAIN" ||
 echo "=== 9. Cron ==="
 (crontab -u otbasy -l 2>/dev/null; cat "$APP_DIR/deploy/crontab.txt") | crontab -u otbasy -
 
+echo "=== 9.1. Logrotate ==="
+cp "$APP_DIR/deploy/logrotate.conf" /etc/logrotate.d/otbasy
+
 echo "=== 10. Запуск бота ==="
 systemctl start otbasy-bot
 systemctl status otbasy-bot --no-pager

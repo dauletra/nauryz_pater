@@ -28,6 +28,7 @@ logging.basicConfig(
 )
 
 app = FastAPI()
+config.validate()
 
 
 # ---------------------------------------------------------------------------
@@ -706,6 +707,9 @@ def _handle_successful_payment(user_id: int, payment: dict) -> None:
 
     charge_id = (payment.get("provider_payment_charge_id")
                  or payment.get("telegram_payment_charge_id", ""))
+    if storage.payment_exists(charge_id):
+        logger.warning("Дубликат платежа проигнорирован: %s", charge_id)
+        return
     storage.log_payment(
         user_id=user_id,
         region_guid=region_guid,
@@ -850,10 +854,9 @@ def _handle_update(update: dict) -> None:
 
 @app.post("/webhook")
 async def bot_webhook(request: Request, background_tasks: BackgroundTasks) -> Response:
-    if config.WEBHOOK_SECRET:
-        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != config.WEBHOOK_SECRET:
-            logger.warning("Неверный webhook secret token")
-            return Response("ok")
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != config.WEBHOOK_SECRET:
+        logger.warning("Неверный webhook secret token")
+        return Response("Forbidden", status_code=403)
 
     update = await request.json()
     if not update:

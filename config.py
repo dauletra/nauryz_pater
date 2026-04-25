@@ -21,3 +21,11 @@ ADMIN_USER_ID     = int(os.environ.get("ADMIN_USER_ID", "0"))
 NEW_OR_SECONDARY   = 1
 OBJECT_STATUS      = 1
 OBJECT_STATUS_NAME = "Прием заявлений"
+
+
+def validate() -> None:
+    """Проверить обязательные переменные окружения. Вызывать при старте."""
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN не задан в .env")
+    if not WEBHOOK_SECRET:
+        raise RuntimeError("WEBHOOK_SECRET не задан в .env")

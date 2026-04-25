@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import time
 
 import requests
 
@@ -122,6 +123,23 @@ def _deduplicate(cards: list[dict]) -> list[dict]:
     return list({c["id"]: c for c in cards if c["id"]}.values())
 
 
+def _fetch_with_retry(session: requests.Session, csrf: str | None,
+                      region_guid: str, region_name: str, page_num: int,
+                      *, attempts: int = 3) -> list[dict]:
+    """Вызвать _fetch_page с экспоненциальным backoff при сбоях сети."""
+    delay = 5
+    for attempt in range(1, attempts + 1):
+        try:
+            return _fetch_page(session, csrf, region_guid, region_name, page_num)
+        except Exception as e:
+            if attempt == attempts:
+                raise
+            logger.warning("[%s] Попытка %d/%d не удалась (стр. %d): %s. Жду %ds...",
+                           region_name, attempt, attempts, page_num, e, delay)
+            time.sleep(delay)
+            delay *= 2
+
+
 def fetch_all_listings(region_guid: str, region_name: str) -> list[dict]:
     """Получить все объекты для указанного региона."""
     with _make_session() as session:
@@ -130,7 +148,7 @@ def fetch_all_listings(region_guid: str, region_name: str) -> list[dict]:
 
         logger.info("[%s] Запрашиваю страницу 1...", region_name)
         try:
-            objects_p1 = _fetch_page(session, csrf, region_guid, region_name, 1)
+            objects_p1 = _fetch_with_retry(session, csrf, region_guid, region_name, 1)
         except Exception as e:
             logger.error("[%s] Ошибка запроса к API: %s", region_name, e)
             return []
@@ -147,7 +165,7 @@ def fetch_all_listings(region_guid: str, region_name: str) -> list[dict]:
         for page_num in range(2, total_pages + 1):
             logger.info("[%s] Страница %d/%d ...", region_name, page_num, total_pages)
             try:
-                objects = _fetch_page(session, csrf, region_guid, region_name, page_num)
+                objects = _fetch_with_retry(session, csrf, region_guid, region_name, page_num)
                 logger.info("  получено %d объектов", len(objects))
                 all_raw.extend(objects)
             except Exception as e:

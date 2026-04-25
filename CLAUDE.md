@@ -45,11 +45,13 @@ OtbasyCrawler/
   telegram_api.py   — Класс TelegramAPI: единая точка Telegram Bot API вызовов
   requirements.txt  — Зависимости: requests, fastapi, uvicorn, python-dotenv
   run_crawler.py    — Cron entry point (каждые 10 мин, защита от параллельных запусков)
-  run_daily.py      — Cron entry point (отчёт + очистка + напоминания об истечении, 14:00 UTC)
+  run_notifier.py   — Cron entry point (отправка уведомлений из очереди, каждые 10 мин)
+  run_daily.py      — Cron entry point (отчёт + очистка + напоминания об истечении, 15:00 UTC)
+  check.py          — Утилита ручной диагностики (crawl, db, sim-new, sim-changed, test-msg)
   data/             — SQLite БД (gitignore)
   venv/             — локальный venv (gitignore)
-  deploy/           — Конфиги сервера (systemd, nginx, crontab, setup.sh)
-  functions/        — УСТАРЕЛО (Firebase-наследие, можно удалить)
+  deploy/           — Конфиги сервера (systemd, nginx, crontab, setup.sh, logrotate.conf)
+  docs/             — Документация: deploy.md, monitoring.md, updates.md
 ```
 
 ---
@@ -76,6 +78,8 @@ venv/bin/pip install -r requirements.txt
 venv/bin/uvicorn bot:app --reload       # бот
 venv/bin/python run_crawler.py          # тест краулера
 ```
+
+Подробная документация: `docs/deploy.md`, `docs/monitoring.md`, `docs/updates.md`.
 
 ---
 
@@ -284,7 +288,7 @@ FastAPI приложение. Отвечает Telegram мгновенно (200 
 
 ## run_daily.py
 
-Запускается cron'ом в 14:00 UTC (20:00 Алматы). Выполняет четыре задачи:
+Запускается cron'ом в 15:00 UTC (20:00 Алматы). Выполняет четыре задачи:
 
 1. `cleanup_old_snapshots(days=90)` — удаляет старые снимки
 2. `cleanup_expired_subscriptions(days=90)` — удаляет давно истёкшие подписки (payments не трогает)
@@ -319,7 +323,8 @@ FastAPI приложение. Отвечает Telegram мгновенно (200 
 
 Cron на VPS (Ubuntu, UTC по умолчанию):
 - `*/10 * * * *` — краулер каждые 10 мин
-- `0 14 * * *` — ежедневный отчёт (14:00 UTC = 20:00 Алматы)
+- `2-59/10 * * * *` — нотификатор каждые 10 мин (со смещением 2 мин)
+- `0 15 * * *` — ежедневный отчёт (15:00 UTC = 20:00 Алматы)
 
 ---
 

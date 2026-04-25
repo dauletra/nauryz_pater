@@ -495,6 +495,15 @@ def get_payment_stats() -> dict:
         "retention_pct":  retention_pct,
     }
 
+def payment_exists(telegram_charge_id: str) -> bool:
+    """Проверить, был ли уже обработан этот charge_id (защита от дублей)."""
+    row = _db().execute(
+        "SELECT 1 FROM payments WHERE telegram_charge_id = ?",
+        (telegram_charge_id,),
+    ).fetchone()
+    return row is not None
+
+
 def log_payment(user_id: int, region_guid: str, stars_amount: int,
                 telegram_charge_id: str, invoice_payload: str) -> None:
     """Записать факт оплаты. Таблица payments не очищается."""

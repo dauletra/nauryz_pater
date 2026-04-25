@@ -43,7 +43,10 @@
       "Bash(del \"C:\\\\Users\\\\Daulet-asus\\\\PycharmProjects\\\\OtbasyCrawler\\\\functions\\\\main.py\")",
       "PowerShell(Get-ChildItem \"C:\\\\Users\\\\Daulet-asus\\\\PycharmProjects\\\\OtbasyCrawler\" | Where-Object { $_.Name -ne '.venv' } | Select-Object Name)",
       "Bash(python -m py_compile bot.py storage.py telegram_api.py crawler.py run_daily.py run_notifier.py runner.py)",
-      "Bash(python -m py_compile storage.py notifier.py run_daily.py)"
+      "Bash(python -m py_compile storage.py notifier.py run_daily.py)",
+      "Bash(python -m py_compile check.py)",
+      "PowerShell(New-Item -ItemType Directory -Path \"C:\\\\Users\\\\Daulet-asus\\\\PycharmProjects\\\\OtbasyCrawler\\\\docs\" -Force)",
+      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\Daulet-asus\\\\PycharmProjects\\\\OtbasyCrawler\" -Force | Where-Object { $_.Name -notmatch '\\\\.venv|\\\\.idea' } | Select-Object Name, PSIsContainer | Format-Table -AutoSize)"
     ]
   }
 }
