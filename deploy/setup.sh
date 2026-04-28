@@ -4,8 +4,8 @@
 
 set -e
 
-DOMAIN="YOUR_DOMAIN"   # <-- вписать домен или IP
-REPO_URL="YOUR_REPO"   # <-- вписать URL git-репозитория
+DOMAIN="bot.balaproza.site"   # <-- вписать домен или IP
+REPO_URL="https://github.com/dauletra/nauryz_pater"   # <-- вписать URL git-репозитория
 APP_DIR="/opt/otbasy/app"
 DATA_DIR="/opt/otbasy/data"
 LOG_DIR="/var/log/otbasy"
