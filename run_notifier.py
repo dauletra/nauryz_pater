@@ -20,7 +20,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-_LOCK_PATH = "/tmp/otbasy_notifier.lock"
+_LOCK_PATH = "/var/lock/otbasy_notifier.lock"
 
 try:
     import fcntl

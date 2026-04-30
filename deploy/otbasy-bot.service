@@ -7,8 +7,11 @@ User=otbasy
 WorkingDirectory=/opt/otbasy/app
 EnvironmentFile=/opt/otbasy/app/.env
 ExecStart=/opt/otbasy/venv/bin/uvicorn bot:app --host 127.0.0.1 --port 8000
-Restart=always
-RestartSec=5
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=120
+StartLimitBurst=5
+MemoryMax=256M
 StandardOutput=journal
 StandardError=journal
 

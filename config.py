@@ -29,3 +29,8 @@ def validate() -> None:
         raise RuntimeError("TELEGRAM_TOKEN не задан в .env")
     if not WEBHOOK_SECRET:
         raise RuntimeError("WEBHOOK_SECRET не задан в .env")
+    if not ADMIN_USER_ID:
+        import logging
+        logging.getLogger(__name__).warning(
+            "ADMIN_USER_ID не задан — уведомления об оплатах и дневные отчёты не будут отправлены"
+        )

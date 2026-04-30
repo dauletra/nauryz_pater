@@ -98,5 +98,15 @@ class TelegramAPI:
         })
         return result.get("ok", False)
 
+    def set_my_commands(self, commands: list[dict],
+                        scope: dict | None = None,
+                        language_code: str | None = None) -> bool:
+        result = self._call("setMyCommands", {
+            "commands":      commands,
+            "scope":         scope,
+            "language_code": language_code,
+        })
+        return result.get("ok", False)
+
 
 tg = TelegramAPI(config.TELEGRAM_TOKEN)

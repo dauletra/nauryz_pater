@@ -44,6 +44,7 @@ SUBSCRIPTION_DAYS=30
 # Ваш Telegram user_id — узнать у @userinfobot
 ADMIN_USER_ID=0
 EOF
+chown otbasy:otbasy "$APP_DIR/.env"
 chmod 600 "$APP_DIR/.env"
 echo ">>> Откройте $APP_DIR/.env и впишите реальные токены!"
 
@@ -53,6 +54,7 @@ systemctl daemon-reload
 systemctl enable otbasy-bot
 
 echo "=== 7. nginx ==="
+cp "$APP_DIR/deploy/nginx-rate-limit.conf" /etc/nginx/conf.d/otbasy-rate-limit.conf
 cp "$APP_DIR/deploy/nginx.conf" /etc/nginx/sites-available/otbasy
 sed -i "s/YOUR_DOMAIN/$DOMAIN/g" /etc/nginx/sites-available/otbasy
 ln -sf /etc/nginx/sites-available/otbasy /etc/nginx/sites-enabled/otbasy
@@ -65,7 +67,31 @@ certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m admin@"$DOMAIN" ||
 echo "=== 9. Cron ==="
 (crontab -u otbasy -l 2>/dev/null; cat "$APP_DIR/deploy/crontab.txt") | crontab -u otbasy -
 
-echo "=== 9.1. Logrotate ==="
+echo "=== 9.1. Скрипт healthcheck ==="
+cp "$APP_DIR/deploy/healthcheck.sh" /opt/otbasy/healthcheck.sh
+chmod +x /opt/otbasy/healthcheck.sh
+# */5 * * * * — проверка каждые 5 минут (запускаем от root, чтобы иметь доступ к .env)
+(crontab -l 2>/dev/null; echo "*/5 * * * * /opt/otbasy/healthcheck.sh >> /var/log/otbasy/healthcheck.log 2>&1") | crontab -
+
+echo "=== 9.2. Скрипт бэкапа БД ==="
+BACKUP_DIR="/opt/otbasy/backups"
+mkdir -p "$BACKUP_DIR"
+chown otbasy:otbasy "$BACKUP_DIR"
+cat > /opt/otbasy/backup_db.sh <<'BEOF'
+#!/bin/bash
+# Безопасный бэкап SQLite через .backup (совместим с WAL mode)
+DB="/opt/otbasy/data/otbasy.db"
+OUT="/opt/otbasy/backups/otbasy_$(date +%Y%m%d_%H%M%S).db"
+sqlite3 "$DB" ".backup '$OUT'" && echo "Backup OK: $OUT"
+# Оставляем только последние 7 копий
+ls -t /opt/otbasy/backups/otbasy_*.db 2>/dev/null | tail -n +8 | xargs -r rm -f
+BEOF
+chmod +x /opt/otbasy/backup_db.sh
+chown otbasy:otbasy /opt/otbasy/backup_db.sh
+# Добавляем в cron otbasy: ежедневно в 03:00 UTC
+(crontab -u otbasy -l 2>/dev/null; echo "0 3 * * * /opt/otbasy/backup_db.sh >> /var/log/otbasy/backup.log 2>&1") | crontab -u otbasy -
+
+echo "=== 9.3. Logrotate ==="
 cp "$APP_DIR/deploy/logrotate.conf" /etc/logrotate.d/otbasy
 
 echo "=== 10. Запуск бота ==="

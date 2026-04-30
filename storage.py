@@ -138,6 +138,31 @@ def _init_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_nqueue_status
             ON notification_queue(status, created_at);
+
+        CREATE TABLE IF NOT EXISTS promo_codes (
+            code         TEXT PRIMARY KEY,
+            discount_pct INTEGER NOT NULL CHECK(discount_pct BETWEEN 1 AND 100),
+            max_uses     INTEGER NOT NULL CHECK(max_uses > 0),
+            uses_count   INTEGER NOT NULL DEFAULT 0,
+            is_active    INTEGER NOT NULL DEFAULT 1,
+            expires_at   TEXT,
+            created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS promo_uses (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            code     TEXT    NOT NULL REFERENCES promo_codes(code),
+            user_id  INTEGER NOT NULL REFERENCES users(user_id),
+            used_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            UNIQUE(code, user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS user_states (
+            user_id    INTEGER PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+            state      TEXT    NOT NULL,
+            payload    TEXT    NOT NULL DEFAULT '{}',
+            updated_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        );
     """)
     conn.commit()
 
@@ -198,6 +223,13 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE subscriptions ADD COLUMN weekly_signal_at TEXT")
         conn.commit()
         logger.info("Миграция: добавлена колонка subscriptions.weekly_signal_at")
+
+    # Миграция 4: payments.promo_code
+    pay_cols = {row[1] for row in conn.execute("PRAGMA table_info(payments)").fetchall()}
+    if "promo_code" not in pay_cols:
+        conn.execute("ALTER TABLE payments ADD COLUMN promo_code TEXT")
+        conn.commit()
+        logger.info("Миграция: добавлена колонка payments.promo_code")
 
 
 # ---------------------------------------------------------------------------
@@ -505,14 +537,128 @@ def payment_exists(telegram_charge_id: str) -> bool:
 
 
 def log_payment(user_id: int, region_guid: str, stars_amount: int,
-                telegram_charge_id: str, invoice_payload: str) -> None:
+                telegram_charge_id: str, invoice_payload: str,
+                promo_code: str | None = None) -> None:
     """Записать факт оплаты. Таблица payments не очищается."""
     _db().execute(
         """INSERT INTO payments
-               (user_id, region_guid, stars_amount, telegram_charge_id, invoice_payload)
-           VALUES (?, ?, ?, ?, ?)""",
-        (user_id, region_guid, stars_amount, telegram_charge_id, invoice_payload),
+               (user_id, region_guid, stars_amount, telegram_charge_id, invoice_payload, promo_code)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (user_id, region_guid, stars_amount, telegram_charge_id, invoice_payload, promo_code),
     )
+    _db().commit()
+
+
+# ---------------------------------------------------------------------------
+# Promo codes
+# ---------------------------------------------------------------------------
+
+def create_promo_code(code: str, discount_pct: int, max_uses: int,
+                      expires_at: str | None = None) -> bool:
+    """Создать промокод. Возвращает False если код уже существует."""
+    try:
+        _db().execute(
+            """INSERT INTO promo_codes (code, discount_pct, max_uses, expires_at)
+               VALUES (?, ?, ?, ?)""",
+            (code.upper(), discount_pct, max_uses, expires_at),
+        )
+        _db().commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def validate_promo_code(code: str, user_id: int) -> dict | None:
+    """Проверить промокод. Возвращает dict с полями или None если недействителен."""
+    row = _db().execute(
+        """SELECT code, discount_pct, max_uses, uses_count FROM promo_codes
+           WHERE code = ?
+             AND is_active = 1
+             AND uses_count < max_uses
+             AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))""",
+        (code.upper(),),
+    ).fetchone()
+    if not row:
+        return None
+    already_used = _db().execute(
+        "SELECT 1 FROM promo_uses WHERE code = ? AND user_id = ?",
+        (code.upper(), user_id),
+    ).fetchone()
+    if already_used:
+        return None
+    return dict(row)
+
+
+def use_promo_code(code: str, user_id: int) -> bool:
+    """Зафиксировать использование промокода. Возвращает False при гонке."""
+    try:
+        _db().execute(
+            "INSERT INTO promo_uses (code, user_id) VALUES (?, ?)",
+            (code.upper(), user_id),
+        )
+        _db().execute(
+            "UPDATE promo_codes SET uses_count = uses_count + 1 WHERE code = ?",
+            (code.upper(),),
+        )
+        _db().commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def deactivate_promo_code(code: str) -> bool:
+    """Деактивировать промокод досрочно. Возвращает False если код не найден."""
+    cur = _db().execute(
+        "UPDATE promo_codes SET is_active = 0 WHERE code = ?",
+        (code.upper(),),
+    )
+    _db().commit()
+    return cur.rowcount > 0
+
+
+def get_promo_codes() -> list[dict]:
+    """Все промокоды для /promos."""
+    rows = _db().execute(
+        """SELECT code, discount_pct, max_uses, uses_count, is_active, expires_at, created_at
+           FROM promo_codes ORDER BY created_at DESC""",
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# User states (promo input flow, etc.)
+# ---------------------------------------------------------------------------
+
+def set_user_state(user_id: int, state: str, payload: dict) -> None:
+    """Сохранить текущее состояние пользователя (используется для ввода промокода)."""
+    _db().execute(
+        """INSERT INTO user_states (user_id, state, payload, updated_at)
+           VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+           ON CONFLICT(user_id) DO UPDATE SET
+               state      = excluded.state,
+               payload    = excluded.payload,
+               updated_at = excluded.updated_at""",
+        (user_id, state, json.dumps(payload, ensure_ascii=False)),
+    )
+    _db().commit()
+
+
+def get_user_state(user_id: int) -> dict | None:
+    """Вернуть текущее состояние пользователя или None если нет/устарело (> 1 часа)."""
+    row = _db().execute(
+        """SELECT state, payload FROM user_states
+           WHERE user_id = ?
+             AND updated_at > datetime('now', '-1 hour')""",
+        (user_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return {"state": row["state"], "payload": json.loads(row["payload"])}
+
+
+def clear_user_state(user_id: int) -> None:
+    """Удалить состояние пользователя."""
+    _db().execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
     _db().commit()
 
 
@@ -600,6 +746,39 @@ def get_region_objects(region_guid: str) -> list[dict]:
         (region_guid,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_price_trends(region_guid: str) -> dict[str, dict]:
+    """Вернуть динамику цен для ЖК региона: {inner_code: {curr, prev, diff_pct}}.
+
+    Использует два последних снимка на объект (ROW_NUMBER по убыванию id).
+    Возвращает только объекты, у которых есть предыдущая цена.
+    """
+    rows = _db().execute(
+        """WITH ranked AS (
+               SELECT s.inner_code, s.price,
+                      ROW_NUMBER() OVER (PARTITION BY s.inner_code ORDER BY s.id DESC) AS rn
+               FROM object_snapshots s
+               JOIN objects o ON o.inner_code = s.inner_code
+               WHERE o.region_guid = ?
+                 AND s.price IS NOT NULL AND s.price > 0
+           )
+           SELECT inner_code,
+                  MAX(CASE WHEN rn = 1 THEN price END) AS curr_price,
+                  MAX(CASE WHEN rn = 2 THEN price END) AS prev_price
+           FROM ranked
+           WHERE rn <= 2
+           GROUP BY inner_code
+           HAVING prev_price IS NOT NULL""",
+        (region_guid,),
+    ).fetchall()
+    result = {}
+    for row in rows:
+        curr, prev = row["curr_price"], row["prev_price"]
+        if curr and prev and curr != prev:
+            diff_pct = round((curr - prev) / prev * 100, 1)
+            result[row["inner_code"]] = {"curr": curr, "prev": prev, "diff_pct": diff_pct}
+    return result
 
 
 def cleanup_old_snapshots(days: int = 90) -> int:

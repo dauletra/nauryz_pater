@@ -8,13 +8,12 @@ from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import Response
 
 import config
+import crawler_lock
 import notifier
 import regions
 import runner
 import storage
 from telegram_api import tg
-
-_crawler_lock = threading.Lock()
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +28,35 @@ logging.basicConfig(
 
 app = FastAPI()
 config.validate()
+
+
+@app.on_event("startup")
+async def _on_startup() -> None:
+    # Команды для всех пользователей
+    tg.set_my_commands([
+        {"command": "start",   "description": "Показать меню"},
+        {"command": "objects", "description": "Список ЖК по регионам"},
+        {"command": "my",      "description": "Мои подписки"},
+        {"command": "help",    "description": "Справка"},
+    ])
+    # Дополнительные команды только для администратора
+    if config.ADMIN_USER_ID:
+        tg.set_my_commands(
+            commands=[
+                {"command": "start",     "description": "Показать меню"},
+                {"command": "objects",   "description": "Список ЖК по регионам"},
+                {"command": "my",        "description": "Мои подписки"},
+                {"command": "help",      "description": "Справка"},
+                {"command": "admin",           "description": "📊 Статистика и аналитика"},
+                {"command": "broadcast",       "description": "📢 Рассылка всем подписчикам"},
+                {"command": "run",             "description": "🔄 Запустить краулер вручную"},
+                {"command": "addadmin",        "description": "👤 Назначить администратора"},
+                {"command": "newpromo",        "description": "🎟 Создать промокод: КОД СКИДКА ЛИМИТ"},
+                {"command": "promos",          "description": "📋 Список всех промокодов"},
+                {"command": "deactivatepromo", "description": "🚫 Деактивировать промокод"},
+            ],
+            scope={"type": "chat", "chat_id": config.ADMIN_USER_ID},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -77,10 +105,21 @@ def _kb_main_menu() -> dict:
     ]}
 
 
+def _kb_reply_main() -> dict:
+    return {
+        "keyboard": [[
+            {"text": "🏘 Квартиры"},
+            {"text": "📋 Мои подписки"},
+            {"text": "❓ Помощь"},
+        ]],
+        "resize_keyboard": True,
+        "persistent": True,
+    }
+
+
 def _kb_regions_page(page: int = 0,
                      item_prefix: str = "subscribe",
-                     page_prefix: str = "regions_page",
-                     back_callback: str = "menu:main") -> dict:
+                     page_prefix: str = "regions_page") -> dict:
     """Постраничный список регионов. Префиксы позволяют переиспользовать для разных flow."""
     all_regions = regions.get_all_regions()
     PAGE_SIZE = 12
@@ -105,7 +144,6 @@ def _kb_regions_page(page: int = 0,
     if nav:
         rows.append(nav)
 
-    rows.append([{"text": "🔙 Главное меню", "callback_data": back_callback}])
     return {"inline_keyboard": rows}
 
 
@@ -122,7 +160,6 @@ def _kb_objects_region(region_guid: str, sub_until: str | None) -> dict:
         rows.append([{"text": f"🔔 Подписаться · {config.STARS_PRICE} Stars",
                       "callback_data": f"subscribe:{region_guid}"}])
     rows.append([{"text": "🔙 К регионам", "callback_data": "objects_page:0"}])
-    rows.append([{"text": "🏠 Главное меню", "callback_data": "menu:main"}])
     return {"inline_keyboard": rows}
 
 
@@ -130,7 +167,19 @@ def _kb_confirm_subscribe(region_guid: str, region_name: str) -> dict:
     return {"inline_keyboard": [
         [{"text": f"💫 Оплатить {config.STARS_PRICE} Stars",
           "callback_data": f"pay:{region_guid}"}],
-        [{"text": "🔙 К регионам", "callback_data": "objects_page:0"}],
+        [{"text": "🎟 У меня есть промокод",
+          "callback_data": f"enter_promo:{region_guid}"}],
+        [{"text": "🔙 Назад", "callback_data": f"objects_region:{region_guid}"}],
+    ]}
+
+
+def _kb_confirm_subscribe_promo(region_guid: str, discounted_stars: int) -> dict:
+    return {"inline_keyboard": [
+        [{"text": f"💫 Оплатить {discounted_stars} Stars",
+          "callback_data": f"pay:{region_guid}"}],
+        [{"text": "❌ Отменить промокод",
+          "callback_data": f"cancel_promo:{region_guid}"}],
+        [{"text": "🔙 Назад", "callback_data": f"objects_region:{region_guid}"}],
     ]}
 
 
@@ -148,7 +197,6 @@ def _kb_my_subscriptions(subs: list[dict]) -> dict:
             label = f"📍 {region_name}  ·  до {until}"
         rows.append([{"text": label, "callback_data": f"manage_sub:{sub['region_guid']}"}])
     rows.append([{"text": "➕ Добавить регион", "callback_data": "menu:objects"}])
-    rows.append([{"text": "🔙 Главное меню",    "callback_data": "menu:main"}])
     return {"inline_keyboard": rows}
 
 
@@ -192,7 +240,8 @@ def _kb_back_to_menu() -> dict:
 # Objects list helpers
 # ---------------------------------------------------------------------------
 
-def _format_objects_message(region_name: str, objects: list[dict]) -> str:
+def _format_objects_message(region_name: str, objects: list[dict],
+                            price_trends: dict | None = None) -> str:
     available   = [o for o in objects if o.get("available")]
     unavailable = [o for o in objects if not o.get("available")]
 
@@ -219,9 +268,17 @@ def _format_objects_message(region_name: str, objects: list[dict]) -> str:
             name      = html.escape(o.get("name") or o.get("address") or "—")
             avail     = o["available"]
             price     = o.get("price")
-            price_str = f" · {price:,} ₸/м²".replace(",", " ") if price else ""
             url       = o.get("url", "")
             label     = f'<a href="{html.escape(url)}">{name}</a>' if url else name
+
+            trend_str = ""
+            if price and price_trends:
+                trend = price_trends.get(o.get("inner_code", ""))
+                if trend:
+                    arrow = "📈" if trend["diff_pct"] > 0 else "📉"
+                    trend_str = f" {arrow}{abs(trend['diff_pct'])}%"
+
+            price_str = f" · {price:,} ₸/м²{trend_str}".replace(",", " ") if price else ""
             lines.append(f"{i}. {label} — <b>{avail} кв.</b>{price_str}")
     else:
         lines.append("✅ <b>Доступных квартир нет</b>")
@@ -247,9 +304,10 @@ def _format_objects_message(region_name: str, objects: list[dict]) -> str:
 
 
 def _show_region_objects(user_id: int, msg_id: int, region_guid: str) -> None:
-    region_name = regions.get_region_name(region_guid)
-    objects     = storage.get_region_objects(region_guid)
-    text        = _format_objects_message(region_name, objects)
+    region_name  = regions.get_region_name(region_guid)
+    objects      = storage.get_region_objects(region_guid)
+    price_trends = storage.get_price_trends(region_guid)
+    text         = _format_objects_message(region_name, objects, price_trends)
 
     sub = next(
         (s for s in storage.get_user_subscriptions(user_id)
@@ -275,9 +333,8 @@ def _handle_start(user_id: int, first_name: str) -> None:
         f"👋 Привет, <b>{name}</b>!\n\n"
         f"Слежу за квартирами на <b>Baspana</b> по всем регионам Казахстана.\n"
         f"Как только появится новый объект или изменится доступность — "
-        f"вы узнаете первым.\n\n"
-        f"Выберите регион чтобы посмотреть актуальные данные:",
-        reply_markup=_kb_main_menu(),
+        f"вы узнаете первым.",
+        reply_markup=_kb_reply_main(),
     )
 
 
@@ -304,7 +361,6 @@ def _handle_objects(user_id: int) -> None:
         reply_markup=_kb_regions_page(
             item_prefix="objects_region",
             page_prefix="objects_page",
-            back_callback="menu:main",
         ),
     )
 
@@ -316,7 +372,7 @@ def _handle_help(user_id: int) -> None:
         "Бот отслеживает новые квартиры на baspana.otbasybank.kz "
         "и присылает уведомления по вашим регионам.\n\n"
         "<b>Команды:</b>\n"
-        "/start — главное меню\n"
+        "/start — показать меню\n"
         "/objects — список ЖК по региону\n"
         "/my — мои подписки\n"
         "/help — эта справка\n\n"
@@ -325,7 +381,6 @@ def _handle_help(user_id: int) -> None:
         "• Оплата через встроенную систему Telegram\n"
         "• Можно подписаться на несколько регионов\n\n"
         "По вопросам: обратитесь к администратору.",
-        reply_markup=_kb_back_to_menu(),
     )
 
 
@@ -401,12 +456,78 @@ def _handle_add_admin(actor_id: int, args: str) -> None:
     _send(actor_id, f"✅ Пользователь {target_id} назначен администратором.")
 
 
+def _handle_new_promo(actor_id: int, args: str) -> None:
+    parts = args.split()
+    if len(parts) != 3:
+        _send(actor_id,
+              "Использование: /newpromo КОД СКИДКА ЛИМИТ\n"
+              "Пример: /newpromo SUMMER50 50 20\n"
+              "Скидка — число от 1 до 100 (100 = бесплатно).")
+        return
+    code_raw, disc_raw, limit_raw = parts
+    code = code_raw.upper()
+    try:
+        discount_pct = int(disc_raw)
+        max_uses     = int(limit_raw)
+    except ValueError:
+        _send(actor_id, "❌ Скидка и лимит должны быть целыми числами.")
+        return
+    if not (1 <= discount_pct <= 100):
+        _send(actor_id, "❌ Скидка должна быть от 1 до 100.")
+        return
+    if max_uses <= 0:
+        _send(actor_id, "❌ Лимит должен быть больше 0.")
+        return
+    if not code.replace("_", "").isalnum():
+        _send(actor_id, "❌ Код может содержать только латинские буквы, цифры и _.")
+        return
+    if not storage.create_promo_code(code, discount_pct, max_uses):
+        _send(actor_id, f"❌ Промокод <b>{html.escape(code)}</b> уже существует.")
+        return
+    discounted = max(1, round(config.STARS_PRICE * (100 - discount_pct) / 100))
+    free_str   = " (бесплатная подписка)" if discount_pct == 100 else f" → {discounted} Stars"
+    _send(actor_id,
+          f"✅ Промокод создан:\n\n"
+          f"🏷 Код: <code>{html.escape(code)}</code>\n"
+          f"💸 Скидка: {discount_pct}%{free_str}\n"
+          f"👥 Лимит: {max_uses} использований")
+
+
+def _handle_list_promos(actor_id: int) -> None:
+    promos = storage.get_promo_codes()
+    if not promos:
+        _send(actor_id, "Промокодов пока нет. Создайте: /newpromo КОД СКИДКА ЛИМИТ")
+        return
+    lines = ["🎟 <b>Промокоды:</b>\n"]
+    for p in promos:
+        status   = "✅" if p["is_active"] else "🚫"
+        expires  = f"  до {p['expires_at'][:10]}" if p["expires_at"] else ""
+        discount = p["discount_pct"]
+        free_str = " (бесплатно)" if discount == 100 else f" (-{discount}%)"
+        lines.append(
+            f"{status} <code>{html.escape(p['code'])}</code>{free_str}  "
+            f"{p['uses_count']}/{p['max_uses']} исп.{expires}"
+        )
+    _send(actor_id, "\n".join(lines))
+
+
+def _handle_deactivate_promo(actor_id: int, args: str) -> None:
+    code = args.strip().upper()
+    if not code:
+        _send(actor_id, "Использование: /deactivatepromo КОД")
+        return
+    if storage.deactivate_promo_code(code):
+        _send(actor_id, f"🚫 Промокод <code>{html.escape(code)}</code> деактивирован.")
+    else:
+        _send(actor_id, f"❌ Промокод <b>{html.escape(code)}</b> не найден.")
+
+
 # ---------------------------------------------------------------------------
 # Callback sub-handlers  (user_id, msg_id, cq_id, suffix)
 # ---------------------------------------------------------------------------
 
 def _cb_menu_main(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
-    _edit(user_id, msg_id, "Главное меню:", reply_markup=_kb_main_menu())
+    _edit(user_id, msg_id, "Используйте кнопки меню снизу ↓")
 
 
 def _cb_menu_my(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
@@ -427,7 +548,6 @@ def _cb_menu_objects(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None
           reply_markup=_kb_regions_page(
               item_prefix="objects_region",
               page_prefix="objects_page",
-              back_callback="menu:main",
           ))
 
 
@@ -438,8 +558,7 @@ def _cb_menu_help(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
           f"💫 <b>Подписка:</b> {config.STARS_PRICE} Stars "
           f"за регион на {config.SUBSCRIPTION_DAYS} дней\n"
           "Оплата через встроенную систему Telegram.\n"
-          "Можно подписаться на несколько регионов.",
-          reply_markup=_kb_back_to_menu())
+          "Можно подписаться на несколько регионов.")
 
 
 _MENU_SUB: dict = {}  # заполняется после объявления функций
@@ -464,7 +583,6 @@ def _cb_objects_page(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None
               page=page,
               item_prefix="objects_region",
               page_prefix="objects_page",
-              back_callback="menu:main",
           ))
 
 
@@ -507,7 +625,35 @@ def _cb_pay(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
     if not regions.is_valid_region(region_guid):
         logger.warning("Недействительный region_guid в pay: %s", region_guid)
         return
-    _send_invoice(user_id, region_guid, regions.get_region_name(region_guid))
+    region_name = regions.get_region_name(region_guid)
+
+    _state = storage.get_user_state(user_id)
+    promo = _state["payload"] if _state and _state["state"] == "promo_applied" else None
+    if promo:
+        storage.clear_user_state(user_id)
+    if promo and promo["region_guid"] == region_guid:
+        code             = promo["code"]
+        discounted_stars = promo["discounted_stars"]
+        _edit(user_id, msg_id,
+              f"💫 Оплата подписки\n<b>{html.escape(region_name)}</b>\n"
+              f"🎟 Скидка {promo['discount_pct']}% · {discounted_stars} Stars\n\n"
+              f"Счёт выставлен ниже 👇")
+        tg.send_invoice(
+            user_id,
+            title=f"Подписка: {region_name}",
+            description=(
+                f"Уведомления о новых квартирах в регионе «{region_name}» "
+                f"на {config.SUBSCRIPTION_DAYS} дней"
+            ),
+            payload=f"sub:{region_guid}:promo:{code}:{discounted_stars}",
+            currency="XTR",
+            prices=[{"label": "Подписка", "amount": discounted_stars}],
+        )
+    else:
+        _edit(user_id, msg_id,
+              f"💫 Оплата подписки\n<b>{html.escape(region_name)}</b>\n\n"
+              f"Счёт выставлен ниже 👇")
+        _send_invoice(user_id, region_guid, region_name)
 
 
 def _cb_manage_sub(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
@@ -622,6 +768,38 @@ def _cb_unsub_confirm(user_id: int, msg_id: int, cq_id: str, suffix: str) -> Non
           ]})
 
 
+def _cb_enter_promo(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    region_guid = suffix
+    if not regions.is_valid_region(region_guid):
+        return
+    storage.set_user_state(user_id, "promo_pending", {"region_guid": region_guid, "msg_id": msg_id})
+    _edit(user_id, msg_id,
+          "🎟 Введите промокод в чат:",
+          reply_markup={"inline_keyboard": [
+              [{"text": "❌ Отмена", "callback_data": f"cancel_promo:{region_guid}"}],
+          ]})
+
+
+def _cb_cancel_promo(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    region_guid = suffix
+    storage.clear_user_state(user_id)
+    if not regions.is_valid_region(region_guid):
+        return
+    region_name = regions.get_region_name(region_guid)
+    objects   = storage.get_region_objects(region_guid)
+    available = sum(1 for o in objects if o.get("available"))
+    total     = len(objects)
+    live_str  = (f"Сейчас доступно квартир: <b>{available} ЖК из {total}</b>\n\n"
+                 if total else "")
+    _edit(user_id, msg_id,
+          f"📍 <b>{html.escape(region_name)}</b>\n\n"
+          f"{live_str}"
+          f"Подписка даёт мгновенные уведомления — вы узнаете о новых объектах "
+          f"и изменениях доступности раньше всех.\n\n"
+          f"💫 <b>{config.STARS_PRICE} Stars</b>  ·  {config.SUBSCRIPTION_DAYS} дней",
+          reply_markup=_kb_confirm_subscribe(region_guid, region_name))
+
+
 _MENU_SUB.update({
     "main":    _cb_menu_main,
     "my":      _cb_menu_my,
@@ -642,6 +820,8 @@ _CB_HANDLERS: dict = {
     "unsub":          _cb_unsub,
     "unsub_soft":     _cb_unsub_soft,
     "unsub_confirm":  _cb_unsub_confirm,
+    "enter_promo":    _cb_enter_promo,
+    "cancel_promo":   _cb_cancel_promo,
 }
 
 
@@ -685,8 +865,22 @@ def _handle_callback(callback_query: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _handle_pre_checkout(query: dict) -> None:
-    amount = query.get("total_amount", 0)
-    if amount != config.STARS_PRICE:
+    amount  = query.get("total_amount", 0)
+    payload = query.get("invoice_payload", "")
+
+    # Формат со скидкой: sub:{guid}:promo:{code}:{stars}
+    parts = payload.split(":")
+    if len(parts) == 5 and parts[2] == "promo":
+        try:
+            expected = int(parts[4])
+        except ValueError:
+            _answer_precheckout(query["id"], ok=False, error="Неверный формат счёта.")
+            return
+        if amount != expected:
+            logger.warning("pre_checkout promo: неверная сумма %d (ожидается %d)", amount, expected)
+            _answer_precheckout(query["id"], ok=False, error="Неверная сумма счёта.")
+            return
+    elif amount != config.STARS_PRICE:
         logger.warning("pre_checkout: неверная сумма %d (ожидается %d)", amount, config.STARS_PRICE)
         _answer_precheckout(
             query["id"], ok=False,
@@ -702,7 +896,10 @@ def _handle_successful_payment(user_id: int, payment: dict) -> None:
         logger.error("Неизвестный invoice_payload: %s", payload)
         return
 
-    region_guid = payload.split(":", 1)[1]
+    # Парсим payload: sub:{guid} или sub:{guid}:promo:{code}:{stars}
+    parts       = payload.split(":")
+    region_guid = parts[1]
+    promo_code  = parts[3] if len(parts) == 5 and parts[2] == "promo" else None
     region_name = regions.get_region_name(region_guid)
 
     charge_id = (payment.get("provider_payment_charge_id")
@@ -710,12 +907,17 @@ def _handle_successful_payment(user_id: int, payment: dict) -> None:
     if storage.payment_exists(charge_id):
         logger.warning("Дубликат платежа проигнорирован: %s", charge_id)
         return
+
+    if promo_code:
+        storage.use_promo_code(promo_code, user_id)
+
     storage.log_payment(
         user_id=user_id,
         region_guid=region_guid,
         stars_amount=payment.get("total_amount", config.STARS_PRICE),
         telegram_charge_id=charge_id,
         invoice_payload=payload,
+        promo_code=promo_code,
     )
 
     paid_until = storage.activate_subscription(
@@ -727,14 +929,80 @@ def _handle_successful_payment(user_id: int, payment: dict) -> None:
     notifier.send_subscription_activated(str(user_id), region_name, paid_until)
 
     if config.ADMIN_USER_ID:
-        stars = payment.get("total_amount", config.STARS_PRICE)
+        stars      = payment.get("total_amount", config.STARS_PRICE)
+        promo_line = f"\n🎟 Промокод: {html.escape(promo_code)}" if promo_code else ""
         notifier.send_message(
             f"💰 <b>Новая оплата</b>\n"
             f"👤 User ID: {user_id}\n"
             f"📍 Регион: {html.escape(region_name)}\n"
-            f"💫 Stars: {stars}",
+            f"💫 Stars: {stars}{promo_line}",
             chat_id=str(config.ADMIN_USER_ID),
         )
+
+
+def _handle_promo_input(user_id: int, text: str) -> None:
+    """Обработать текст как ввод промокода."""
+    state = storage.get_user_state(user_id)
+    if not state or state["state"] != "promo_pending":
+        return
+    pending     = state["payload"]
+    region_guid = pending["region_guid"]
+    msg_id      = pending["msg_id"]
+    code        = text.strip().upper()
+    storage.clear_user_state(user_id)
+
+    promo = storage.validate_promo_code(code, user_id)
+    if not promo:
+        # Возвращаем состояние ожидания, показываем ошибку
+        storage.set_user_state(user_id, "promo_pending", pending)
+        _send(user_id, f'❌ Промокод <b>{html.escape(code)}</b> недействителен, исчерпан или уже использован.\n\nПопробуйте ещё раз или нажмите Отмена.')
+        return
+
+    discount_pct      = promo["discount_pct"]
+    discounted_stars  = max(1, round(config.STARS_PRICE * (100 - discount_pct) / 100))
+
+    if discount_pct == 100:
+        # Бесплатная подписка — активируем сразу
+        storage.use_promo_code(code, user_id)
+        storage.log_payment(
+            user_id=user_id,
+            region_guid=region_guid,
+            stars_amount=0,
+            telegram_charge_id=f"promo:{code}:{user_id}",
+            invoice_payload=f"sub:{region_guid}",
+            promo_code=code,
+        )
+        paid_until = storage.activate_subscription(user_id, region_guid,
+                                                   days=config.SUBSCRIPTION_DAYS)
+        region_name = regions.get_region_name(region_guid)
+        _edit(user_id, msg_id,
+              f"🎉 Промокод <b>{html.escape(code)}</b> применён!\n"
+              f"Подписка на <b>{html.escape(region_name)}</b> активирована бесплатно.")
+        notifier.send_subscription_activated(str(user_id), region_name, paid_until)
+        if config.ADMIN_USER_ID:
+            notifier.send_message(
+                f"🎟 <b>Промокод использован (100%)</b>\n"
+                f"👤 User ID: {user_id}\n"
+                f"📍 Регион: {html.escape(region_name)}\n"
+                f"🏷 Код: {html.escape(code)}",
+                chat_id=str(config.ADMIN_USER_ID),
+            )
+        return
+
+    # Частичная скидка — сохраняем и показываем экран с новой ценой
+    storage.set_user_state(user_id, "promo_applied", {
+        "code":             code,
+        "region_guid":      region_guid,
+        "discount_pct":     discount_pct,
+        "discounted_stars": discounted_stars,
+    })
+    region_name = regions.get_region_name(region_guid)
+    _edit(user_id, msg_id,
+          f"📍 <b>{html.escape(region_name)}</b>\n\n"
+          f"🎟 Промокод <b>{html.escape(code)}</b> применён — скидка {discount_pct}%\n\n"
+          f"<s>{config.STARS_PRICE}</s> → <b>{discounted_stars} Stars</b>  ·  "
+          f"{config.SUBSCRIPTION_DAYS} дней",
+          reply_markup=_kb_confirm_subscribe_promo(region_guid, discounted_stars))
 
 
 # ---------------------------------------------------------------------------
@@ -788,6 +1056,23 @@ def _handle_update(update: dict) -> None:
         if user_data and not user_data.get("is_admin"):
             storage.set_admin(user_id, True)
 
+    # Ввод промокода (перехватываем до любых команд)
+    _us = storage.get_user_state(user_id)
+    if _us and _us["state"] == "promo_pending":
+        _handle_promo_input(user_id, text)
+        return
+
+    # Reply Keyboard кнопки
+    if text == "🏘 Квартиры":
+        _handle_objects(user_id)
+        return
+    if text == "📋 Мои подписки":
+        _handle_my(user_id)
+        return
+    if text == "❓ Помощь":
+        _handle_help(user_id)
+        return
+
     cmd  = text.split()[0].lower().split("@")[0]
     args = text[len(cmd):].strip()
 
@@ -821,10 +1106,29 @@ def _handle_update(update: dict) -> None:
         else:
             _send(user_id, "⛔ Нет доступа.")
 
+    elif cmd == "/newpromo":
+        if storage.is_admin(user_id):
+            _handle_new_promo(user_id, args)
+        else:
+            _send(user_id, "⛔ Нет доступа.")
+
+    elif cmd == "/promos":
+        if storage.is_admin(user_id):
+            _handle_list_promos(user_id)
+        else:
+            _send(user_id, "⛔ Нет доступа.")
+
+    elif cmd == "/deactivatepromo":
+        if storage.is_admin(user_id):
+            _handle_deactivate_promo(user_id, args)
+        else:
+            _send(user_id, "⛔ Нет доступа.")
+
     elif cmd == "/run":
         if storage.is_admin(user_id):
-            if not _crawler_lock.acquire(blocking=False):
-                _send(user_id, "⏳ Краулер уже запущен, дождитесь завершения.")
+            lock_fd = crawler_lock.acquire()
+            if lock_fd is None:
+                _send(user_id, "⏳ Краулер уже запущен (cron или другой /run), дождитесь завершения.")
             else:
                 _send(user_id, "⏳ Запускаю краулер по всем регионам...")
 
@@ -838,7 +1142,7 @@ def _handle_update(update: dict) -> None:
                     except Exception as e:
                         _send(user_id, f"❌ Ошибка: {str(e)[:200]}")
                     finally:
-                        _crawler_lock.release()
+                        crawler_lock.release(lock_fd)
 
                 threading.Thread(target=_do_run, daemon=True).start()
         else:
