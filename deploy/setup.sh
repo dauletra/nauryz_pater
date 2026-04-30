@@ -11,7 +11,7 @@ DATA_DIR="/opt/otbasy/data"
 LOG_DIR="/var/log/otbasy"
 
 echo "=== 1. Системные пакеты ==="
-apt update && apt install -y python3.11 python3.11-venv nginx certbot python3-certbot-nginx git
+apt update && apt install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx git
 
 echo "=== 2. Пользователь и директории ==="
 useradd -r -s /bin/false otbasy || true
@@ -24,7 +24,7 @@ git clone "$REPO_URL" "$APP_DIR"
 chown -R otbasy:otbasy /opt/otbasy
 
 echo "=== 4. Python venv ==="
-python3.11 -m venv /opt/otbasy/venv
+python3 -m venv /opt/otbasy/venv
 /opt/otbasy/venv/bin/pip install --upgrade pip
 /opt/otbasy/venv/bin/pip install -r "$APP_DIR/requirements.txt"
 
