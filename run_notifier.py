@@ -91,7 +91,7 @@ def main() -> None:
         sys.exit(0)
 
     try:
-        logger.info("=== OtbasyNotifier старт ===")
+        logger.info("=== Nauryz Pater Bot: нотификатор старт ===")
         events = storage.get_pending_notifications()
 
         if not events:

@@ -2,9 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Архитектура
+## Проект
 
-Мультипользовательский Telegram-бот — мониторит новые квартиры на baspana.otbasybank.kz по всем регионам Казахстана. Пользователи могут бесплатно просматривать список ЖК по любому региону. Платная подписка (Telegram Stars) даёт автоматические уведомления о новых объектах и изменениях доступности.
+**Nauryz Pater Bot** (`@nauryz_pater_bot`) — мультипользовательский Telegram-бот, который мониторит новые квартиры на baspana.otbasybank.kz по всем регионам Казахстана. Пользователи могут бесплатно просматривать список ЖК по любому региону. Платная подписка (Telegram Stars) даёт автоматические уведомления о новых объектах и изменениях доступности.
 
 **Платформа:** VPS Ubuntu 24.04 — FastAPI + uvicorn + nginx + SQLite + cron
 
@@ -34,13 +34,14 @@ Telegram → nginx → uvicorn → bot.py (/webhook)
 ## Структура проекта
 
 ```
-OtbasyCrawler/
+nauryz_pater/
   bot.py            — FastAPI webhook, все обработчики бота
   crawler.py        — HTTP-краулер baspana.otbasybank.kz
+  crawler_lock.py   — fcntl-лок для предотвращения параллельных запусков краулера
   storage.py        — SQLite: все операции с БД
   notifier.py       — Форматирование и отправка сообщений (через TelegramAPI)
   runner.py         — Оркестрация: run_all_regions(), run_region()
-  regions.py        — 20 регионов Казахстана с GUID из API
+  regions.py        — 20 регионов Казахстана с GUID из API (названия на русском)
   config.py         — Переменные окружения (из .env через python-dotenv)
   telegram_api.py   — Класс TelegramAPI: единая точка Telegram Bot API вызовов
   requirements.txt  — Зависимости: requests, fastapi, uvicorn, python-dotenv
@@ -105,17 +106,20 @@ tg.send_invoice(chat_id, title, description, payload, currency, prices) → bool
 
 ## База данных SQLite (storage.py)
 
-**7 таблиц:**
+**10 таблиц:**
 
 | Таблица | Назначение |
 |---|---|
 | `users` | Telegram-пользователи: user_id, username, is_admin |
 | `subscriptions` | user_id + region_guid + paid_until + cancelled_at |
-| `payments` | Неудаляемый лог всех покупок: user_id, region_guid, stars_amount, telegram_charge_id, paid_at |
+| `payments` | Неудаляемый лог всех покупок: user_id, region_guid, stars_amount, telegram_charge_id, paid_at, promo_code |
 | `objects` | Мастер-данные ЖК: inner_code, region_guid, name, address, builder… |
 | `object_snapshots` | История доступности: `price INTEGER`, FK → objects с CASCADE |
 | `crawler_state` | Оперативный статус краулера per-регион + legacy дневная статистика |
 | `crawler_daily_stats` | История статистики по дням (region_guid + date = PK) |
+| `user_states` | Временное состояние пользователя (промокод и др.): user_id PK, state, payload JSON, updated_at; TTL 1 час |
+| `promo_codes` | Справочник промокодов: code, discount_pct, max_uses, expires_at |
+| `promo_uses` | Факты использования промокодов: code + user_id |
 
 **Индексы:**
 - `idx_snapshots_inner_code` ON object_snapshots(inner_code)
@@ -147,17 +151,21 @@ tg.send_invoice(chat_id, title, description, payload, currency, prices) → bool
 - `save_snapshot(inner_code, listing, *, autocommit=True)`
 - `get_latest_snapshot(inner_code)`
 - `get_region_objects(region_guid)` → все ЖК с последним снимком, сортировка по available DESC
+- `get_price_trends(region_guid)` → dict `{inner_code: {curr, prev, diff_pct}}` — два последних снимка per-объект через ROW_NUMBER() OVER; используется для отображения 📈📉 в списке ЖК
 - `cleanup_old_snapshots(days=90)` → вызывается из run_daily.py
 - `cleanup_expired_subscriptions(days=90)` → удаляет истёкшие подписки старше N дней (`payments` не трогает)
 - `begin_transaction()` / `commit()` / `rollback()` — для батч-операций
 - `update_crawler_state()` / `update_daily_stats()` / `get_daily_stats()`
 - `get_daily_history(days=30)` → история из crawler_daily_stats
+- `set_user_state(user_id, state, payload)` / `get_user_state(user_id)` / `clear_user_state(user_id)` — временное состояние с TTL 1 час (промокод и т.п.)
 
 **Соединение:** `threading.local()` — per-thread, WAL mode, foreign_keys=ON.
 
 **Миграции (`_migrate_schema()`):**
 1. Пересоздаёт `object_snapshots` если `price` имеет тип TEXT
 2. Добавляет `subscriptions.cancelled_at` если отсутствует
+3. Добавляет таблицы `user_states`, `promo_codes`, `promo_uses` если отсутствуют
+4. Добавляет `payments.promo_code` если отсутствует
 
 **Формат дат:** везде `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')` — UTC с суффиксом Z.
 
@@ -205,9 +213,22 @@ tg.send_invoice(chat_id, title, description, payload, currency, prices) → bool
 
 ---
 
+## crawler_lock.py
+
+Единый fcntl-лок для предотвращения параллельных запусков краулера — используется и в `run_crawler.py` (cron) и в боте (`/run`).
+
+```python
+LOCK_PATH = "/var/lock/otbasy_crawler.lock"
+
+acquire() → int | None   # возвращает fd или None если уже занят
+release(fd: int) → None
+```
+
+---
+
 ## regions.py
 
-20 регионов Казахстана (3 города + 17 областей). GUID взяты из HTML страницы `/pool/search` (Vue.js dropdown).
+20 регионов Казахстана (3 города + 17 областей). GUID взяты из HTML страницы `/pool/search` (Vue.js dropdown). Названия на **русском** языке.
 
 ```python
 REGIONS: dict[str, str] = { guid: name, ... }
@@ -234,7 +255,7 @@ FastAPI приложение. Отвечает Telegram мгновенно (200 
 - `/admin` — полная аналитика: пользователи, подписки, выручка Stars (сегодня/30д/всего), новые подписчики, продления, отток, retention%, краулер
 - `/broadcast <текст>` — рассылка всем активным подписчикам (в отдельном потоке)
 - `/addadmin <user_id>` — назначить администратора (проверяет существование в БД)
-- `/run` — запустить краулер немедленно (в отдельном потоке, защита от двойного запуска через `_crawler_lock`)
+- `/run` — запустить краулер немедленно (в отдельном потоке, защита через `crawler_lock.acquire()`)
 
 **Telegram Stars (подписка):**
 - `pre_checkout_query` → проверяет `total_amount == config.STARS_PRICE`, отклоняет несовпадение
@@ -243,8 +264,9 @@ FastAPI приложение. Отвечает Telegram мгновенно (200 
 **callback_data формат:**
 - `menu:main` / `menu:regions` / `menu:my` / `menu:help` / `menu:objects`
 - `menu:regions` — редиректит в objects-flow (единый вход)
-- `objects_region:{guid}` → показать список ЖК региона
-- `objects_page:{n}` → постраничная навигация
+- `objects_region:{guid}` → показать список ЖК региона (страница 0)
+- `obj_page:{guid}:{page}` → постраничная навигация списка ЖК (15 объектов/стр.)
+- `objects_page:{n}` → навигация по списку регионов
 - `subscribe:{guid}` → карточка подписки с живыми данными (кол-во доступных ЖК)
 - `pay:{guid}` → отправить Stars-инвойс
 - `manage_sub:{guid}` → экран управления подпиской (Продлить / Отписаться)
@@ -254,9 +276,16 @@ FastAPI приложение. Отвечает Telegram мгновенно (200 
 - `sub_info:{guid}` → тост с датой истечения
 - `regions_page:{n}` → постраничная навигация
 
+**Список ЖК (objects flow):**
+- `_OBJECTS_PAGE_SIZE = 15` — объектов на страницу
+- `_format_objects_message(objects, trends, page)` — форматирует страницу с href-ссылками на карточку ЖК и значками 📈📉 из `get_price_trends()`
+- Текст обрезается по `rfind("\n", 0, 3900)` чтобы не ломать HTML-теги
+- `_kb_objects_region_paged(guid, page, total_pages)` — кнопки ◀ N/Total ▶ + Подписаться
+
 **Клавиатуры:**
 - `_kb_main_menu()` — три кнопки: Квартиры / Мои подписки / Помощь
 - `_kb_regions_page(page, item_prefix, page_prefix, back_callback)` — переиспользуется для объектов
+- `_kb_objects_region_paged(guid, page, total_pages)` — навигация по ЖК региона
 - `_kb_manage_sub(region_guid)` — для активной подписки: Продлить / Назад / Отписаться
 - `_kb_manage_sub_cancelled(region_guid)` — для мягко отменённой: Возобновить / Остановить сейчас / Назад
 - `_kb_confirm_unsub(region_guid, until_str)` — три варианта: получать до DATE / остановить сейчас / отмена
@@ -311,7 +340,7 @@ FastAPI приложение. Отвечает Telegram мгновенно (200 
 | `SQLITE_PATH` | `data/otbasy.db` | Путь к файлу БД |
 | `STARS_PRICE` | `250` | Цена подписки в Telegram Stars |
 | `SUBSCRIPTION_DAYS` | `30` | Срок подписки в днях |
-| `ADMIN_USER_ID` | `0` | Telegram user_id администратора |
+| `ADMIN_USER_ID` | `0` | Telegram user_id администратора (0 = не задан, выводит warning при старте) |
 
 ---
 
@@ -359,7 +388,8 @@ Cron на VPS (Ubuntu, UTC по умолчанию):
 
 **HTML в сообщениях:**
 - Любые данные из БД или от пользователя экранировать через `html.escape()` перед подстановкой в HTML-строки
+- Текст обрезать по `rfind("\n", 0, 3900)` — чтобы не разрезать HTML-теги посередине
 
 **Параллельные запуски:**
-- `run_crawler.py` защищён `fcntl.flock` — второй процесс завершается с exit(0)
-- `/run` в боте защищён `_crawler_lock = threading.Lock()`
+- И `run_crawler.py` (cron), и `/run` в боте используют единый `crawler_lock.py` — `fcntl.flock` на файл `/var/lock/otbasy_crawler.lock`
+- Если лок занят: cron-процесс завершается с exit(0), `/run` в боте сообщает пользователю что краулер уже работает

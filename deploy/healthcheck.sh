@@ -46,10 +46,10 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') status=$STATUS http=$HTTP_CODE prev=$PREV_STA
 
 if [ "$STATUS" != "ok" ] && [ "$PREV_STATE" = "ok" ]; then
     # Переход ok → degraded/down
-    send_alert "🚨 <b>Otbasy Bot — проблема</b>%0Astatus: <code>${STATUS}</code>%0Ahttp: ${HTTP_CODE}"
+    send_alert "🚨 <b>Nauryz Pater Bot — проблема</b>%0Astatus: <code>${STATUS}</code>%0Ahttp: ${HTTP_CODE}"
 elif [ "$STATUS" = "ok" ] && [ "$PREV_STATE" != "ok" ]; then
     # Восстановление
-    send_alert "✅ <b>Otbasy Bot — восстановлен</b>%0Astatus: ok"
+    send_alert "✅ <b>Nauryz Pater Bot — восстановлен</b>%0Astatus: ok"
 fi
 
 echo "$STATUS" > "$STATE_FILE"

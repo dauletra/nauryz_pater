@@ -24,7 +24,7 @@ def main() -> None:
         sys.exit(0)
 
     try:
-        logger.info("=== OtbasyCrawler старт ===")
+        logger.info("=== Nauryz Pater Bot: краулер старт ===")
         result = runner.run_all_regions()
         logger.info(
             "=== Завершён: новых=%d изменений=%d всего=%d ===",

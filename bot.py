@@ -68,7 +68,10 @@ def _send(chat_id: int | str, text: str, **kwargs) -> bool:
 
 
 def _edit(chat_id: int | str, message_id: int, text: str, reply_markup=None) -> bool:
-    return tg.edit_message_text(chat_id, message_id, text, reply_markup=reply_markup)
+    ok = tg.edit_message_text(chat_id, message_id, text, reply_markup=reply_markup)
+    if not ok:
+        logger.warning("_edit failed: chat=%s msg=%s text_len=%d", chat_id, message_id, len(text))
+    return ok
 
 
 def _answer_callback(callback_query_id: str, text: str = "") -> bool:
@@ -240,8 +243,12 @@ def _kb_back_to_menu() -> dict:
 # Objects list helpers
 # ---------------------------------------------------------------------------
 
+_OBJECTS_PAGE_SIZE = 15
+
+
 def _format_objects_message(region_name: str, objects: list[dict],
-                            price_trends: dict | None = None) -> str:
+                            price_trends: dict | None = None,
+                            page: int = 0) -> str:
     available   = [o for o in objects if o.get("available")]
     unavailable = [o for o in objects if not o.get("available")]
 
@@ -263,13 +270,17 @@ def _format_objects_message(region_name: str, objects: list[dict],
         return "\n".join(lines)
 
     if available:
-        lines.append(f"✅ <b>Доступные квартиры ({len(available)}):</b>")
-        for i, o in enumerate(available, 1):
-            name      = html.escape(o.get("name") or o.get("address") or "—")
-            avail     = o["available"]
-            price     = o.get("price")
-            url       = o.get("url", "")
-            label     = f'<a href="{html.escape(url)}">{name}</a>' if url else name
+        total_pages = (len(available) - 1) // _OBJECTS_PAGE_SIZE + 1
+        start = page * _OBJECTS_PAGE_SIZE
+        chunk = available[start: start + _OBJECTS_PAGE_SIZE]
+        page_str = f"  ·  стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
+        lines.append(f"✅ <b>Доступные квартиры ({len(available)}){page_str}:</b>")
+        for i, o in enumerate(chunk, start + 1):
+            name  = html.escape(o.get("name") or o.get("address") or "—")
+            avail = o["available"]
+            price = o.get("price")
+            url   = o.get("url", "")
+            label = f'<a href="{html.escape(url)}">{name}</a>' if url else f"<b>{name}</b>"
 
             trend_str = ""
             if price and price_trends:
@@ -289,25 +300,52 @@ def _format_objects_message(region_name: str, objects: list[dict],
         names = [html.escape(o.get("name") or o.get("address") or "—")
                  for o in unavailable]
         lines.append(f"📭 <b>Нет доступных ({len(unavailable)}):</b>")
-        chunk, cur_len, chunks = [], 0, []
+        chunk_str, cur_len, chunks = [], 0, []
         for n in names:
-            if cur_len + len(n) > 80 and chunk:
-                chunks.append(", ".join(chunk))
-                chunk, cur_len = [], 0
-            chunk.append(n)
+            if cur_len + len(n) > 80 and chunk_str:
+                chunks.append(", ".join(chunk_str))
+                chunk_str, cur_len = [], 0
+            chunk_str.append(n)
             cur_len += len(n) + 2
-        if chunk:
-            chunks.append(", ".join(chunk))
+        if chunk_str:
+            chunks.append(", ".join(chunk_str))
         lines.extend(chunks)
 
     return "\n".join(lines)
 
 
-def _show_region_objects(user_id: int, msg_id: int, region_guid: str) -> None:
+def _kb_objects_region_paged(region_guid: str, sub_until: str | None,
+                             page: int, total_available: int) -> dict:
+    rows = []
+    total_pages = (total_available - 1) // _OBJECTS_PAGE_SIZE + 1 if total_available else 1
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append({"text": "◀", "callback_data": f"obj_page:{region_guid}:{page - 1}"})
+        nav.append({"text": f"{page + 1}/{total_pages}", "callback_data": f"obj_page:{region_guid}:{page}"})
+        if page < total_pages - 1:
+            nav.append({"text": "▶", "callback_data": f"obj_page:{region_guid}:{page + 1}"})
+        rows.append(nav)
+    if sub_until:
+        try:
+            until = datetime.fromisoformat(sub_until).strftime("%d.%m.%Y")
+        except Exception:
+            until = sub_until[:10]
+        rows.append([{"text": f"🔔 Подписан до {until}",
+                      "callback_data": f"sub_info:{region_guid}"}])
+    else:
+        rows.append([{"text": f"🔔 Подписаться · {config.STARS_PRICE} Stars",
+                      "callback_data": f"subscribe:{region_guid}"}])
+    rows.append([{"text": "🔙 К регионам", "callback_data": "objects_page:0"}])
+    return {"inline_keyboard": rows}
+
+
+def _show_region_objects(user_id: int, msg_id: int, region_guid: str,
+                         page: int = 0) -> None:
     region_name  = regions.get_region_name(region_guid)
     objects      = storage.get_region_objects(region_guid)
     price_trends = storage.get_price_trends(region_guid)
-    text         = _format_objects_message(region_name, objects, price_trends)
+    available    = [o for o in objects if o.get("available")]
 
     sub = next(
         (s for s in storage.get_user_subscriptions(user_id)
@@ -316,10 +354,9 @@ def _show_region_objects(user_id: int, msg_id: int, region_guid: str) -> None:
     )
     sub_until = sub["paid_until"] if sub else None
 
-    if len(text) > 4000:
-        text = text[:3950] + "\n\n<i>...список обрезан</i>"
-
-    _edit(user_id, msg_id, text, reply_markup=_kb_objects_region(region_guid, sub_until))
+    text = _format_objects_message(region_name, objects, price_trends, page)
+    kb   = _kb_objects_region_paged(region_guid, sub_until, page, len(available))
+    _edit(user_id, msg_id, text, reply_markup=kb)
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +405,7 @@ def _handle_objects(user_id: int) -> None:
 def _handle_help(user_id: int) -> None:
     _send(
         user_id,
-        "<b>OtbasyCrawler — помощь</b>\n\n"
+        "<b>Nauryz Pater Bot — помощь</b>\n\n"
         "Бот отслеживает новые квартиры на baspana.otbasybank.kz "
         "и присылает уведомления по вашим регионам.\n\n"
         "<b>Команды:</b>\n"
@@ -553,7 +590,7 @@ def _cb_menu_objects(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None
 
 def _cb_menu_help(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
     _edit(user_id, msg_id,
-          "<b>OtbasyCrawler — помощь</b>\n\n"
+          "<b>Nauryz Pater Bot — помощь</b>\n\n"
           "Бот отслеживает новые квартиры на baspana.otbasybank.kz.\n\n"
           f"💫 <b>Подписка:</b> {config.STARS_PRICE} Stars "
           f"за регион на {config.SUBSCRIPTION_DAYS} дней\n"
@@ -590,7 +627,22 @@ def _cb_objects_region(user_id: int, msg_id: int, cq_id: str, suffix: str) -> No
     if not regions.is_valid_region(suffix):
         logger.warning("Недействительный region_guid в objects_region: %s", suffix)
         return
-    _show_region_objects(user_id, msg_id, suffix)
+    _show_region_objects(user_id, msg_id, suffix, page=0)
+
+
+def _cb_obj_page(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    """Пагинация внутри региона: suffix = {guid}:{page}"""
+    parts = suffix.rsplit(":", 1)
+    if len(parts) != 2:
+        return
+    region_guid, page_str = parts
+    if not regions.is_valid_region(region_guid):
+        return
+    try:
+        page = max(0, int(page_str))
+    except ValueError:
+        page = 0
+    _show_region_objects(user_id, msg_id, region_guid, page=page)
 
 
 def _cb_subscribe(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
@@ -813,6 +865,7 @@ _CB_HANDLERS: dict = {
     "objects_page":   _cb_objects_page,
     "regions_page":   _cb_objects_page,
     "objects_region": _cb_objects_region,
+    "obj_page":       _cb_obj_page,
     "subscribe":      _cb_subscribe,
     "pay":            _cb_pay,
     "manage_sub":     _cb_manage_sub,

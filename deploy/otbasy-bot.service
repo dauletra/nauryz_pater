@@ -1,5 +1,5 @@
 [Unit]
-Description=Otbasy Telegram Bot (webhook)
+Description=Nauryz Pater Bot (webhook)
 After=network.target
 
 [Service]

@@ -213,7 +213,7 @@ def send_weekly_signal(chat_id: str, region_name: str, region_guid: str) -> bool
 def send_daily_report(runs: int, new: int, changed: int, total: int,
                       chat_id: str | None = None) -> None:
     _send_message(
-        f"📊 <b>Ежедневный отчёт OtbasyCrawler</b>\n\n"
+        f"📊 <b>Ежедневный отчёт Nauryz Pater Bot</b>\n\n"
         f"✅ Краулер работает\n"
         f"🔄 Запусков за сутки: {runs}\n"
         f"🏠 Новых объектов: {new}\n"
