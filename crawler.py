@@ -140,12 +140,31 @@ def _fetch_with_retry(session: requests.Session, csrf: str | None,
             delay *= 2
 
 
-def fetch_all_listings(region_guid: str, region_name: str) -> list[dict]:
-    """Получить все объекты для указанного региона."""
-    with _make_session() as session:
+def make_session() -> requests.Session:
+    """Создать HTTP-сессию (можно переиспользовать для нескольких регионов)."""
+    return _make_session()
+
+
+def get_csrf_token(session: requests.Session) -> str | None:
+    """Получить CSRF-токен для существующей сессии."""
+    return _get_csrf_token(session)
+
+
+def fetch_all_listings(region_guid: str, region_name: str,
+                       session: requests.Session | None = None,
+                       csrf: str | None = None) -> list[dict]:
+    """Получить все объекты для указанного региона.
+
+    Если session/csrf не переданы — создаёт свои (legacy-режим).
+    Для эффективного обхода нескольких регионов передавать общую сессию.
+    """
+    own_session = session is None
+    if own_session:
+        session = _make_session()
         logger.info("[%s] Получаю CSRF-токен...", region_name)
         csrf = _get_csrf_token(session)
 
+    try:
         logger.info("[%s] Запрашиваю страницу 1...", region_name)
         try:
             objects_p1 = _fetch_with_retry(session, csrf, region_guid, region_name, 1)
@@ -172,6 +191,9 @@ def fetch_all_listings(region_guid: str, region_name: str) -> list[dict]:
                 logger.error("[%s] Ошибка страницы %d, прерываю регион: %s",
                              region_name, page_num, e)
                 return []
+    finally:
+        if own_session:
+            session.close()
 
     unique = _deduplicate([_normalize_card(c, region_guid) for c in all_raw])
     logger.info("[%s] Итого уникальных объектов: %d", region_name, len(unique))

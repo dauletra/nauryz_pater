@@ -1,4 +1,5 @@
 import logging
+import time
 
 import crawler
 import regions
@@ -18,12 +19,16 @@ def _find_diffs(prev: dict, current: dict) -> dict:
     return diffs
 
 
-def run_region(region_guid: str, region_name: str) -> dict:
+def run_region(region_guid: str, region_name: str,
+               session=None, csrf: str | None = None) -> dict:
     """Обойти один регион, сохранить изменения, уведомить подписчиков."""
+    t0 = time.monotonic()
     logger.info("=== Регион: %s ===", region_name)
 
     try:
-        current_listings = crawler.fetch_all_listings(region_guid, region_name)
+        current_listings = crawler.fetch_all_listings(
+            region_guid, region_name, session=session, csrf=csrf
+        )
     except Exception as e:
         storage.update_crawler_state(region_guid, "error", error=str(e))
         logger.error("[%s] Ошибка краулера: %s", region_name, e, exc_info=True)
@@ -67,8 +72,10 @@ def run_region(region_guid: str, region_name: str) -> dict:
     storage.update_crawler_state(region_guid, "ok", count=len(current_listings))
     storage.update_daily_stats(region_guid, len(new_objects), len(changed_objects))
 
-    logger.info("[%s] Итого: новых=%d изменений=%d всего=%d",
-                region_name, len(new_objects), len(changed_objects), len(current_listings))
+    elapsed = time.monotonic() - t0
+    logger.info("[%s] Итого: новых=%d изменений=%d всего=%d (%.1fс)",
+                region_name, len(new_objects), len(changed_objects),
+                len(current_listings), elapsed)
 
     return {
         "new":     len(new_objects),
@@ -80,15 +87,23 @@ def run_region(region_guid: str, region_name: str) -> dict:
 def run_all_regions() -> dict:
     """Обойти все регионы Казахстана."""
     total = {"new": 0, "changed": 0, "total": 0}
+    t0 = time.monotonic()
 
-    for region_guid, region_name in regions.get_all_regions():
-        result = run_region(region_guid, region_name)
-        total["new"]     += result["new"]
-        total["changed"] += result["changed"]
-        total["total"]   += result["total"]
+    with crawler.make_session() as session:
+        logger.info("Получаю CSRF-токен (общий на все регионы)...")
+        csrf = crawler.get_csrf_token(session)
+        if csrf is None:
+            logger.warning("CSRF-токен не получен, продолжаю без него")
 
-    logger.info("=== Все регионы завершены: новых=%d изменений=%d всего=%d ===",
-                total["new"], total["changed"], total["total"])
+        for region_guid, region_name in regions.get_all_regions():
+            result = run_region(region_guid, region_name, session=session, csrf=csrf)
+            total["new"]     += result["new"]
+            total["changed"] += result["changed"]
+            total["total"]   += result["total"]
+
+    elapsed = time.monotonic() - t0
+    logger.info("=== Все регионы завершены: новых=%d изменений=%d всего=%d (всего %.0fс / %.1fмин) ===",
+                total["new"], total["changed"], total["total"], elapsed, elapsed / 60)
     return total
 
 
