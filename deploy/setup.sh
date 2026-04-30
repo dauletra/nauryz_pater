@@ -21,10 +21,11 @@ chown otbasy:otbasy "$DATA_DIR" "$LOG_DIR"
 echo "=== 3. Клонирование репозитория ==="
 mkdir -p /opt/otbasy
 git clone "$REPO_URL" "$APP_DIR"
-chown -R otbasy:otbasy /opt/otbasy
+chown -R otbasy:otbasy /opt/otbasy/app
 
 echo "=== 4. Python venv ==="
 python3 -m venv /opt/otbasy/venv
+chown -R otbasy:otbasy /opt/otbasy/venv
 /opt/otbasy/venv/bin/pip install --upgrade pip
 /opt/otbasy/venv/bin/pip install -r "$APP_DIR/requirements.txt"
 
@@ -94,7 +95,10 @@ chown otbasy:otbasy /opt/otbasy/backup_db.sh
 echo "=== 9.3. Logrotate ==="
 cp "$APP_DIR/deploy/logrotate.conf" /etc/logrotate.d/otbasy
 
-echo "=== 10. Запуск бота ==="
+echo "=== 10. Права доступа ==="
+chown -R otbasy:otbasy /opt/otbasy/app /opt/otbasy/venv /opt/otbasy/data /opt/otbasy/backups
+
+echo "=== 11. Запуск бота ==="
 systemctl start otbasy-bot
 systemctl status otbasy-bot --no-pager
 

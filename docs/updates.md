@@ -5,9 +5,14 @@
 ```bash
 cd /opt/otbasy/app
 git pull
+chown -R otbasy:otbasy /opt/otbasy/app   # обязательно если pull запускался от root
 systemctl restart otbasy-bot
 systemctl status otbasy-bot
 ```
+
+> **Важно:** `git pull` запущенный от `root` делает файлы в `app/` владельцем root.
+> Cron и бот работают от пользователя `otbasy` и теряют доступ к файлам.
+> Всегда запускай `chown` после pull от root, или используй `sudo -u otbasy git pull`.
 
 Бот перезапускается за ~2 секунды. Webhook-запросы от Telegram в этот момент
 Telegram автоматически повторит чуть позже — ничего не теряется.
