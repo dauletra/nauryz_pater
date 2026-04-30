@@ -916,6 +916,14 @@ def get_crawler_states() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_crawler_state(region_guid: str) -> dict | None:
+    """Состояние краулера для одного региона."""
+    row = _db().execute(
+        "SELECT * FROM crawler_state WHERE region_guid = ?", (region_guid,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def get_daily_history(days: int = 30) -> list[dict]:
     """История статистики за последние N дней (из новой таблицы)."""
     rows = _db().execute(

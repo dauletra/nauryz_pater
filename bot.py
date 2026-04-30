@@ -248,20 +248,19 @@ _OBJECTS_PAGE_SIZE = 15
 
 def _format_objects_message(region_name: str, objects: list[dict],
                             price_trends: dict | None = None,
-                            page: int = 0) -> str:
+                            page: int = 0,
+                            last_run: str | None = None) -> str:
     available   = [o for o in objects if o.get("available")]
     unavailable = [o for o in objects if not o.get("available")]
 
-    timestamps = [o["timestamp"] for o in objects if o.get("timestamp")]
-    if timestamps:
+    time_str = "—"
+    if last_run:
         try:
-            last_ts  = max(_iso_to_aware(t) for t in timestamps)
+            last_ts  = _iso_to_aware(last_run)
             almaty   = last_ts + timedelta(hours=5)
             time_str = almaty.strftime("%d.%m %H:%M")
         except Exception:
-            time_str = "—"
-    else:
-        time_str = "—"
+            pass
 
     lines = [f"📍 <b>{html.escape(region_name)}</b>  ·  ⏱ {time_str} (UTC+5)", ""]
 
@@ -269,13 +268,20 @@ def _format_objects_message(region_name: str, objects: list[dict],
         lines.append("В базе пока нет данных по этому региону.")
         return "\n".join(lines)
 
-    if available:
-        total_pages = (len(available) - 1) // _OBJECTS_PAGE_SIZE + 1
-        start = page * _OBJECTS_PAGE_SIZE
-        chunk = available[start: start + _OBJECTS_PAGE_SIZE]
-        page_str = f"  ·  стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
-        lines.append(f"✅ <b>Доступные квартиры ({len(available)}){page_str}:</b>")
-        for i, o in enumerate(chunk, start + 1):
+    all_objects = available + unavailable
+    total = len(all_objects)
+    total_pages = max(1, (total - 1) // _OBJECTS_PAGE_SIZE + 1) if total else 1
+    start = page * _OBJECTS_PAGE_SIZE
+    chunk = all_objects[start: start + _OBJECTS_PAGE_SIZE]
+
+    page_str = f"  ·  стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
+
+    chunk_available   = [o for o in chunk if o.get("available")]
+    chunk_unavailable = [o for o in chunk if not o.get("available")]
+
+    if chunk_available:
+        lines.append(f"✅ <b>Доступные ({len(available)}){page_str}:</b>")
+        for i, o in enumerate(chunk_available, start + 1):
             name  = html.escape(o.get("name") or o.get("address") or "—")
             avail = o["available"]
             price = o.get("price")
@@ -291,33 +297,26 @@ def _format_objects_message(region_name: str, objects: list[dict],
 
             price_str = f" · {price:,} ₸/м²{trend_str}".replace(",", " ") if price else ""
             lines.append(f"{i}. {label} — <b>{avail} кв.</b>{price_str}")
-    else:
-        lines.append("✅ <b>Доступных квартир нет</b>")
+    elif not chunk_unavailable:
+        lines.append("В базе пока нет данных по этому региону.")
 
-    lines.append("")
-
-    if unavailable:
-        names = [html.escape(o.get("name") or o.get("address") or "—")
-                 for o in unavailable]
-        lines.append(f"📭 <b>Нет доступных ({len(unavailable)}):</b>")
-        chunk_str, cur_len, chunks = [], 0, []
-        for n in names:
-            if cur_len + len(n) > 80 and chunk_str:
-                chunks.append(", ".join(chunk_str))
-                chunk_str, cur_len = [], 0
-            chunk_str.append(n)
-            cur_len += len(n) + 2
-        if chunk_str:
-            chunks.append(", ".join(chunk_str))
-        lines.extend(chunks)
+    if chunk_unavailable:
+        unavail_page_str = page_str if not chunk_available else ""
+        lines.append("")
+        lines.append(f"📭 <b>Нет доступных ({len(unavailable)}){unavail_page_str}:</b>")
+        for o in chunk_unavailable:
+            name = html.escape(o.get("name") or o.get("address") or "—")
+            url  = o.get("url", "")
+            label = f'<a href="{html.escape(url)}">{name}</a>' if url else name
+            lines.append(f"• {label}")
 
     return "\n".join(lines)
 
 
 def _kb_objects_region_paged(region_guid: str, sub_until: str | None,
-                             page: int, total_available: int) -> dict:
+                             page: int, total_objects: int) -> dict:
     rows = []
-    total_pages = (total_available - 1) // _OBJECTS_PAGE_SIZE + 1 if total_available else 1
+    total_pages = max(1, (total_objects - 1) // _OBJECTS_PAGE_SIZE + 1) if total_objects else 1
     if total_pages > 1:
         nav = []
         if page > 0:
@@ -342,11 +341,11 @@ def _kb_objects_region_paged(region_guid: str, sub_until: str | None,
 
 def _show_region_objects(user_id: int, msg_id: int, region_guid: str,
                          page: int = 0) -> None:
-    region_name  = regions.get_region_name(region_guid)
-    objects      = storage.get_region_objects(region_guid)
-    price_trends = storage.get_price_trends(region_guid)
-    available    = [o for o in objects if o.get("available")]
-
+    region_name   = regions.get_region_name(region_guid)
+    objects       = storage.get_region_objects(region_guid)
+    price_trends  = storage.get_price_trends(region_guid)
+    crawler_state = storage.get_crawler_state(region_guid)
+    last_run      = crawler_state["last_run"] if crawler_state else None
     sub = next(
         (s for s in storage.get_user_subscriptions(user_id)
          if s["region_guid"] == region_guid),
@@ -354,8 +353,8 @@ def _show_region_objects(user_id: int, msg_id: int, region_guid: str,
     )
     sub_until = sub["paid_until"] if sub else None
 
-    text = _format_objects_message(region_name, objects, price_trends, page)
-    kb   = _kb_objects_region_paged(region_guid, sub_until, page, len(available))
+    text = _format_objects_message(region_name, objects, price_trends, page, last_run)
+    kb   = _kb_objects_region_paged(region_guid, sub_until, page, len(objects))
     _edit(user_id, msg_id, text, reply_markup=kb)
 
 
