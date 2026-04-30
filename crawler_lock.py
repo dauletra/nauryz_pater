@@ -1,7 +1,7 @@
 """Shared file lock — prevents simultaneous cron + /run execution."""
 import logging
 
-LOCK_PATH = "/var/lock/otbasy_crawler.lock"
+LOCK_PATH = "/opt/otbasy/crawler.lock"
 
 logger = logging.getLogger(__name__)
 
