@@ -48,10 +48,12 @@ nauryz_pater/
   run_crawler.py    — Cron entry point (каждые 10 мин, защита от параллельных запусков)
   run_notifier.py   — Cron entry point (отправка уведомлений из очереди, каждые 10 мин)
   run_daily.py      — Cron entry point (отчёт + очистка + напоминания об истечении, 15:00 UTC)
+  backup.py         — Управление бэкапами SQLite (create / list / restore)
+  init_rooms.py     — Одноразовый скрипт: первичное наполнение object_room_snapshots
   check.py          — Утилита ручной диагностики (crawl, db, sim-new, sim-changed, test-msg)
-  data/             — SQLite БД (gitignore)
+  data/             — SQLite БД + бэкапы в data/backups/ (gitignore)
   venv/             — локальный venv (gitignore)
-  deploy/           — Конфиги сервера (systemd, nginx, crontab, setup.sh, logrotate.conf)
+  deploy/           — Конфиги сервера (systemd, nginx, crontab, setup.sh, deploy.sh, logrotate.conf)
   docs/             — Документация: deploy.md, monitoring.md, updates.md
 ```
 
@@ -73,6 +75,9 @@ systemctl restart otbasy-bot
 # Зарегистрировать Telegram webhook (один раз)
 curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<DOMAIN>/webhook&secret_token=<WEBHOOK_SECRET>"
 
+# Обновление кода (рекомендуется)
+bash /opt/otbasy/app/deploy/deploy.sh   # бэкап → git pull → restart → статус
+
 # Локальная разработка
 python3.11 -m venv venv
 venv/bin/pip install -r requirements.txt
@@ -81,6 +86,23 @@ venv/bin/python run_crawler.py          # тест краулера
 ```
 
 Подробная документация: `docs/deploy.md`, `docs/monitoring.md`, `docs/updates.md`.
+
+---
+
+## backup.py
+
+Управление бэкапами SQLite через online backup API — безопасно при WAL-режиме (в отличие от `cp`).
+
+```bash
+python backup.py              # создать бэкап (по умолчанию)
+python backup.py list         # список бэкапов
+python backup.py restore <f>  # восстановить (имя файла или полный путь)
+```
+
+- Бэкапы хранятся в `data/backups/`, ротация — последние **10** штук
+- `restore` сохраняет текущую БД как `pre_restore_TIMESTAMP.db` перед перезаписью (эти файлы ротация не трогает)
+- Бэкап создаётся автоматически первым шагом в `deploy/deploy.sh`
+- Если БД не существует — `create` завершается без ошибки (актуально для первой установки)
 
 ---
 
@@ -106,15 +128,16 @@ tg.send_invoice(chat_id, title, description, payload, currency, prices) → bool
 
 ## База данных SQLite (storage.py)
 
-**10 таблиц:**
+**11 таблиц:**
 
 | Таблица | Назначение |
 |---|---|
 | `users` | Telegram-пользователи: user_id, username, is_admin |
-| `subscriptions` | user_id + region_guid + paid_until + cancelled_at |
+| `subscriptions` | user_id + region_guid + paid_until + cancelled_at + notify_mode |
 | `payments` | Неудаляемый лог всех покупок: user_id, region_guid, stars_amount, telegram_charge_id, paid_at, promo_code |
 | `objects` | Мастер-данные ЖК: inner_code, region_guid, name, address, builder… |
 | `object_snapshots` | История доступности: `price INTEGER`, FK → objects с CASCADE |
+| `object_room_snapshots` | История доступности по комнатам: inner_code, rooms_count, available, min_area, max_area, price_sqm, status |
 | `crawler_state` | Оперативный статус краулера per-регион + legacy дневная статистика |
 | `crawler_daily_stats` | История статистики по дням (region_guid + date = PK) |
 | `user_states` | Временное состояние пользователя (промокод и др.): user_id PK, state, payload JSON, updated_at; TTL 1 час |
@@ -123,6 +146,7 @@ tg.send_invoice(chat_id, title, description, payload, currency, prices) → bool
 
 **Индексы:**
 - `idx_snapshots_inner_code` ON object_snapshots(inner_code)
+- `idx_room_snapshots` ON object_room_snapshots(inner_code, crawled_at DESC)
 - `idx_subscriptions_region` ON subscriptions(region_guid)
 - `idx_objects_region` ON objects(region_guid)
 - `idx_subscriptions_active` ON subscriptions(region_guid, paid_until) — покрывающий
@@ -143,8 +167,9 @@ tg.send_invoice(chat_id, title, description, payload, currency, prices) → bool
 - `deactivate_subscription(user_id, region_guid, immediate=True)`:
   - `immediate=True` → DELETE (уведомления прекращаются немедленно)
   - `immediate=False` → ставит `cancelled_at`, уведомления продолжаются до `paid_until`
-- `get_region_subscribers(region_guid)` → list[int] всех с `paid_until > now` (включая мягко отменённых)
-- `get_user_subscriptions(user_id)` → list[dict] с полями `region_guid`, `paid_until`, `cancelled_at`
+- `get_region_subscribers(region_guid)` → list[dict] с полями `user_id`, `notify_mode` — все с `paid_until > now` (включая мягко отменённых)
+- `get_user_subscriptions(user_id)` → list[dict] с полями `region_guid`, `paid_until`, `cancelled_at`, `notify_mode`
+- `set_notify_mode(user_id, region_guid, mode)` — переключить режим уведомлений (`'positive'` | `'all'`)
 - `log_payment(user_id, region_guid, stars_amount, telegram_charge_id, invoice_payload)` → пишет в `payments`, никогда не удаляется
 - `get_payment_stats()` → dict с выручкой (сегодня/30д/всего), новыми подписчиками, продлениями, оттоком и retention%
 - `upsert_object(listing, *, autocommit=True)` — обновляет slug и url
@@ -152,7 +177,10 @@ tg.send_invoice(chat_id, title, description, payload, currency, prices) → bool
 - `get_latest_snapshot(inner_code)`
 - `get_region_objects(region_guid)` → все ЖК с последним снимком, сортировка по available DESC
 - `get_price_trends(region_guid)` → dict `{inner_code: {curr, prev, diff_pct}}` — два последних снимка per-объект через ROW_NUMBER() OVER; используется для отображения 📈📉 в списке ЖК
-- `cleanup_old_snapshots(days=90)` → вызывается из run_daily.py
+- `save_room_snapshot(inner_code, rooms, *, autocommit=True)` — сохраняет список комнат для объекта
+- `get_latest_room_snapshot(inner_code)` → list[dict] последнего снимка комнат
+- `get_all_objects_with_url()` → list[dict] всех объектов с url (для init_rooms.py)
+- `cleanup_old_snapshots(days=90)` → удаляет старые записи из `object_snapshots` и `object_room_snapshots`; вызывается из run_daily.py
 - `cleanup_expired_subscriptions(days=90)` → удаляет истёкшие подписки старше N дней (`payments` не трогает)
 - `begin_transaction()` / `commit()` / `rollback()` — для батч-операций
 - `update_crawler_state()` / `update_daily_stats()` / `get_daily_stats()`
@@ -166,6 +194,7 @@ tg.send_invoice(chat_id, title, description, payload, currency, prices) → bool
 2. Добавляет `subscriptions.cancelled_at` если отсутствует
 3. Добавляет таблицы `user_states`, `promo_codes`, `promo_uses` если отсутствуют
 4. Добавляет `payments.promo_code` если отсутствует
+5. Добавляет `subscriptions.notify_mode TEXT DEFAULT 'positive'` если отсутствует
 
 **Формат дат:** везде `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')` — UTC с суффиксом Z.
 
@@ -210,6 +239,10 @@ tg.send_invoice(chat_id, title, description, payload, currency, prices) → bool
 | `ProgramName` | `program` | Наурыз, Отау и др. |
 | `RpsStatusDate` | `publish_date` | Дата публикации |
 | `TotalPages` | — | Только в первой странице |
+
+**Данные по комнатам (`fetch_room_data(url, session)`):**
+
+Парсит страницу детали ЖК. Данные хранятся в JS-переменной `const model = [...]` — извлекается регэкспом `_ROOM_MODEL_RE`. Возвращает список dict с полями `rooms_count`, `available`, `min_area`, `max_area`, `price_sqm`, `status`. Вызывается из `runner._enrich_with_rooms()` для новых и изменённых объектов.
 
 ---
 
@@ -274,6 +307,7 @@ FastAPI приложение. Отвечает Telegram мгновенно (200 
 - `unsub_soft:{guid}` → мягкая отмена (уведомления до paid_until, `cancelled_at` ставится)
 - `unsub_confirm:{guid}` → немедленная отписка (DELETE)
 - `sub_info:{guid}` → тост с датой истечения
+- `notif_mode:{guid}` → переключить режим уведомлений (positive ↔ all), перерисовать экран
 - `regions_page:{n}` → постраничная навигация
 
 **Список ЖК (objects flow):**
@@ -286,7 +320,7 @@ FastAPI приложение. Отвечает Telegram мгновенно (200 
 - `_kb_main_menu()` — три кнопки: Квартиры / Мои подписки / Помощь
 - `_kb_regions_page(page, item_prefix, page_prefix, back_callback)` — переиспользуется для объектов
 - `_kb_objects_region_paged(guid, page, total_pages)` — навигация по ЖК региона
-- `_kb_manage_sub(region_guid)` — для активной подписки: Продлить / Назад / Отписаться
+- `_kb_manage_sub(region_guid, notify_mode)` — для активной подписки: Продлить / режим уведомлений / Назад / Отписаться
 - `_kb_manage_sub_cancelled(region_guid)` — для мягко отменённой: Возобновить / Остановить сейчас / Назад
 - `_kb_confirm_unsub(region_guid, until_str)` — три варианта: получать до DATE / остановить сейчас / отмена
 
@@ -312,6 +346,26 @@ FastAPI приложение. Отвечает Telegram мгновенно (200 
 - `send_daily_report(runs, new, changed, total, chat_id)`
 
 `_send_message` поддерживает `**kwargs` (в т.ч. `reply_markup`) и передаёт их в `tg.send_message`.
+
+---
+
+## run_notifier.py
+
+Читает очередь событий из БД и отправляет уведомления подписчикам. Запускается cron'ом каждые 10 мин со смещением 2 мин.
+
+**Фильтрация по `notify_mode`:**
+- `'positive'` (по умолчанию) — отправляет только события где хотя бы одно поле выросло
+- `'all'` — отправляет все изменения включая уменьшения
+
+```python
+def _is_positive_change(listing: dict) -> bool:
+    diffs = listing.get("diffs", {})
+    if not diffs:
+        return True
+    return any(v["new"] > v["old"] for v in diffs.values())
+```
+
+Корректно обрабатывает случай когда `available` не изменился, но один тип комнат уменьшился а другой вырос — это позитивный сигнал, уведомление отправляется.
 
 ---
 
