@@ -98,6 +98,13 @@ class TelegramAPI:
         })
         return result.get("ok", False)
 
+    def refund_star_payment(self, user_id: int, telegram_payment_charge_id: str) -> bool:
+        result = self._call("refundStarPayment", {
+            "user_id": user_id,
+            "telegram_payment_charge_id": telegram_payment_charge_id,
+        })
+        return result.get("ok", False)
+
     def set_my_commands(self, commands: list[dict],
                         scope: dict | None = None,
                         language_code: str | None = None) -> bool:

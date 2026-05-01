@@ -224,7 +224,14 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.commit()
         logger.info("Миграция: добавлена колонка subscriptions.weekly_signal_at")
 
-    # Миграция 4: payments.promo_code
+    # Миграция 4: subscriptions.notify_mode
+    sub_cols = {row[1] for row in conn.execute("PRAGMA table_info(subscriptions)").fetchall()}
+    if "notify_mode" not in sub_cols:
+        conn.execute("ALTER TABLE subscriptions ADD COLUMN notify_mode TEXT DEFAULT 'positive'")
+        conn.commit()
+        logger.info("Миграция: добавлена колонка subscriptions.notify_mode")
+
+    # Миграция 5: payments.promo_code
     pay_cols = {row[1] for row in conn.execute("PRAGMA table_info(payments)").fetchall()}
     if "promo_code" not in pay_cols:
         conn.execute("ALTER TABLE payments ADD COLUMN promo_code TEXT")
@@ -361,7 +368,9 @@ def deactivate_subscription(user_id: int, region_guid: str,
 def get_user_subscriptions(user_id: int) -> list[dict]:
     """Подписки пользователя с действующим сроком (активные и мягко отменённые)."""
     rows = _db().execute(
-        """SELECT region_guid, paid_until, cancelled_at FROM subscriptions
+        """SELECT region_guid, paid_until, cancelled_at,
+                  COALESCE(notify_mode, 'positive') AS notify_mode
+           FROM subscriptions
            WHERE user_id = ? AND paid_until > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
            ORDER BY cancelled_at NULLS FIRST, region_guid""",
         (user_id,),
@@ -379,14 +388,24 @@ def is_subscription_active(user_id: int, region_guid: str) -> bool:
     return row is not None
 
 
-def get_region_subscribers(region_guid: str) -> list[int]:
-    """user_id всех пользователей с активной подпиской на регион."""
+def get_region_subscribers(region_guid: str) -> list[dict]:
+    """Подписчики региона с активной подпиской: {user_id, notify_mode}."""
     rows = _db().execute(
-        """SELECT user_id FROM subscriptions
+        """SELECT user_id, COALESCE(notify_mode, 'positive') AS notify_mode
+           FROM subscriptions
            WHERE region_guid = ? AND paid_until > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')""",
         (region_guid,),
     ).fetchall()
-    return [r["user_id"] for r in rows]
+    return [dict(r) for r in rows]
+
+
+def set_notify_mode(user_id: int, region_guid: str, mode: str) -> None:
+    """Установить режим уведомлений: 'positive' или 'all'."""
+    _db().execute(
+        "UPDATE subscriptions SET notify_mode = ? WHERE user_id = ? AND region_guid = ?",
+        (mode, user_id, region_guid),
+    )
+    _db().commit()
 
 
 def get_subscriptions_needing_weekly_signal(days: int = 7) -> list[dict]:
@@ -547,6 +566,20 @@ def log_payment(user_id: int, region_guid: str, stars_amount: int,
         (user_id, region_guid, stars_amount, telegram_charge_id, invoice_payload, promo_code),
     )
     _db().commit()
+
+
+def get_user_payments(user_id: int, limit: int = 5) -> list[dict]:
+    """Последние N реальных платежей пользователя (без промокодов)."""
+    rows = _db().execute(
+        """SELECT id, region_guid, stars_amount, telegram_charge_id, paid_at
+           FROM payments
+           WHERE user_id = ?
+             AND (telegram_charge_id IS NULL OR telegram_charge_id NOT LIKE 'promo:%')
+           ORDER BY paid_at DESC
+           LIMIT ?""",
+        (user_id, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------

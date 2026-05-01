@@ -203,10 +203,12 @@ def _kb_my_subscriptions(subs: list[dict]) -> dict:
     return {"inline_keyboard": rows}
 
 
-def _kb_manage_sub(region_guid: str) -> dict:
+def _kb_manage_sub(region_guid: str, notify_mode: str = "positive") -> dict:
+    mode_label = "📈 Только рост" if notify_mode == "positive" else "🔔 Все изменения"
     return {"inline_keyboard": [
         [{"text": f"🔄 Продлить · {config.STARS_PRICE} Stars",
           "callback_data": f"pay:{region_guid}"}],
+        [{"text": mode_label, "callback_data": f"notif_mode:{region_guid}"}],
         [{"text": "🔙 Мои подписки", "callback_data": "menu:my"}],
         [{"text": "❌ Отписаться",   "callback_data": f"unsub:{region_guid}"}],
     ]}
@@ -492,6 +494,56 @@ def _handle_add_admin(actor_id: int, args: str) -> None:
     _send(actor_id, f"✅ Пользователь {target_id} назначен администратором.")
 
 
+def _handle_refund(actor_id: int, args: str) -> None:
+    parts = args.strip().split()
+    if not parts:
+        _send(actor_id,
+              "Использование:\n"
+              "/refund &lt;user_id&gt; — вернуть последний платёж\n"
+              "/refund &lt;user_id&gt; &lt;payment_id&gt; — вернуть конкретный платёж")
+        return
+    try:
+        target_id = int(parts[0])
+    except ValueError:
+        _send(actor_id, "❌ Неверный user_id.")
+        return
+
+    payments = storage.get_user_payments(target_id)
+    if not payments:
+        _send(actor_id, f"❌ Реальных платежей для пользователя {target_id} не найдено.")
+        return
+
+    if len(parts) >= 2:
+        try:
+            pay_id = int(parts[1])
+        except ValueError:
+            _send(actor_id, "❌ Неверный payment_id.")
+            return
+        payment = next((p for p in payments if p["id"] == pay_id), None)
+        if not payment:
+            _send(actor_id,
+                  f"❌ Платёж #{pay_id} не найден среди последних платежей пользователя {target_id}.")
+            return
+    else:
+        payment = payments[0]
+
+    charge_id = payment["telegram_charge_id"]
+    ok = tg.refund_star_payment(target_id, charge_id)
+    if ok:
+        storage.deactivate_subscription(target_id, payment["region_guid"], immediate=True)
+        region_name = regions.get_region_name(payment["region_guid"])
+        _send(actor_id,
+              f"✅ Возврат {payment['stars_amount']} Stars пользователю {target_id} выполнен.\n"
+              f"Регион: {html.escape(region_name)}\n"
+              f"Платёж: #{payment['id']} от {payment['paid_at'][:10]}\n"
+              f"Подписка деактивирована.")
+    else:
+        _send(actor_id,
+              f"❌ Telegram отклонил возврат для пользователя {target_id}.\n"
+              f"Возможные причины: платёж слишком старый или уже был возвращён.\n"
+              f"charge_id: <code>{html.escape(charge_id)}</code>")
+
+
 def _handle_new_promo(actor_id: int, args: str) -> None:
     parts = args.split()
     if len(parts) != 3:
@@ -727,6 +779,8 @@ def _cb_manage_sub(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
     except Exception:
         until_str = sub["paid_until"][:10]
         days_left = 0
+    notify_mode = sub.get("notify_mode", "positive")
+    mode_text   = "только рост" if notify_mode == "positive" else "все изменения"
     if sub.get("cancelled_at"):
         _edit(user_id, msg_id,
               f"📍 <b>{html.escape(region_name)}</b>\n"
@@ -737,9 +791,10 @@ def _cb_manage_sub(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
     else:
         _edit(user_id, msg_id,
               f"📍 <b>{html.escape(region_name)}</b>\n"
-              f"📅 Активна до: <b>{until_str}</b>  (осталось {days_left} дн.)\n\n"
+              f"📅 Активна до: <b>{until_str}</b>  (осталось {days_left} дн.)\n"
+              f"🔔 Уведомления: <b>{mode_text}</b>\n\n"
               f"Продление добавит {config.SUBSCRIPTION_DAYS} дней к текущей дате истечения.",
-              reply_markup=_kb_manage_sub(region_guid))
+              reply_markup=_kb_manage_sub(region_guid, notify_mode))
 
 
 def _cb_sub_info(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
@@ -859,6 +914,40 @@ _MENU_SUB.update({
     "regions": lambda u, m, c, s: _cb_objects_page(u, m, c, "0"),
 })
 
+def _cb_notif_mode(user_id: int, msg_id: int, cq_id: str, suffix: str) -> None:
+    region_guid = suffix
+    if not regions.is_valid_region(region_guid):
+        _answer_callback(cq_id)
+        return
+    region_name = regions.get_region_name(region_guid)
+    subs = storage.get_user_subscriptions(user_id)
+    sub  = next((s for s in subs if s["region_guid"] == region_guid), None)
+    if not sub:
+        _answer_callback(cq_id, "Подписка не найдена")
+        return
+    current  = sub.get("notify_mode", "positive")
+    new_mode = "all" if current == "positive" else "positive"
+    storage.set_notify_mode(user_id, region_guid, new_mode)
+
+    toast = "🔔 Режим: все изменения" if new_mode == "all" else "📈 Режим: только рост"
+    _answer_callback(cq_id, toast)
+
+    mode_text = "только рост" if new_mode == "positive" else "все изменения"
+    try:
+        until_dt  = _iso_to_aware(sub["paid_until"])
+        until_str = until_dt.strftime("%d.%m.%Y")
+        days_left = max(0, (until_dt - datetime.now(timezone.utc)).days)
+    except Exception:
+        until_str = sub["paid_until"][:10]
+        days_left = 0
+    _edit(user_id, msg_id,
+          f"📍 <b>{html.escape(region_name)}</b>\n"
+          f"📅 Активна до: <b>{until_str}</b>  (осталось {days_left} дн.)\n"
+          f"🔔 Уведомления: <b>{mode_text}</b>\n\n"
+          f"Продление добавит {config.SUBSCRIPTION_DAYS} дней к текущей дате истечения.",
+          reply_markup=_kb_manage_sub(region_guid, new_mode))
+
+
 _CB_HANDLERS: dict = {
     "menu":           _cb_menu,
     "objects_page":   _cb_objects_page,
@@ -868,6 +957,7 @@ _CB_HANDLERS: dict = {
     "subscribe":      _cb_subscribe,
     "pay":            _cb_pay,
     "manage_sub":     _cb_manage_sub,
+    "notif_mode":     _cb_notif_mode,
     "sub_info":       _cb_sub_info,
     "unsub":          _cb_unsub,
     "unsub_soft":     _cb_unsub_soft,
@@ -1155,6 +1245,12 @@ def _handle_update(update: dict) -> None:
     elif cmd == "/addadmin":
         if storage.is_admin(user_id):
             _handle_add_admin(user_id, args)
+        else:
+            _send(user_id, "⛔ Нет доступа.")
+
+    elif cmd == "/refund":
+        if storage.is_admin(user_id):
+            _handle_refund(user_id, args)
         else:
             _send(user_id, "⛔ Нет доступа.")
 

@@ -50,6 +50,19 @@ def _release_lock(fd) -> None:
         pass
 
 
+def _is_positive_change(listing: dict) -> bool:
+    """True если хотя бы одно поле выросло.
+
+    Обрабатывает случай: available=5→5, но finish=3→4 и rough=2→1
+    (продалась черновая, появилась чистовая) — позитивный сигнал для покупателя.
+    Фильтруем только когда ВСЕ изменения — снижения.
+    """
+    diffs = listing.get("diffs", {})
+    if not diffs:
+        return True
+    return any(v["new"] > v["old"] for v in diffs.values())
+
+
 def _process_event(event: dict) -> bool:
     """Отправить одно событие всем подписчикам региона.
 
@@ -69,12 +82,17 @@ def _process_event(event: dict) -> bool:
                 nid, event_type, region_guid, len(subscribers), len(listings))
 
     all_ok = True
-    for user_id in subscribers:
+    for sub in subscribers:
+        user_id     = sub["user_id"]
+        notify_mode = sub["notify_mode"]
         try:
             if event_type == "new":
                 notifier.send_new_listings(listings, chat_id=str(user_id), region_guid=region_guid)
             elif event_type == "changed":
-                notifier.send_changed_listings(listings, chat_id=str(user_id), region_guid=region_guid)
+                to_send = listings if notify_mode == "all" \
+                          else [l for l in listings if _is_positive_change(l)]
+                if to_send:
+                    notifier.send_changed_listings(to_send, chat_id=str(user_id), region_guid=region_guid)
             else:
                 logger.warning("Неизвестный event_type '%s' в событии %d", event_type, nid)
         except Exception as e:
