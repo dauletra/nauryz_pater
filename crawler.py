@@ -157,19 +157,21 @@ def fetch_room_data(url: str, session: requests.Session) -> list[dict]:
         if not m:
             logger.debug("fetch_room_data: const model не найден (%s)", url)
             return []
-        pools = json.loads(m.group(1))
-        return [
-            {
-                "rooms_count": p["roomsCount"],
-                "available":   p.get("freeApartmentsCount", 0),
-                "min_area":    p.get("minArea"),
-                "max_area":    p.get("maxArea"),
-                "price_sqm":   int(p["oneAreaCost"]) if p.get("oneAreaCost") else None,
-                "status":      p.get("statusModel", {}).get("code"),
-            }
-            for p in pools
-            if isinstance(p, dict) and "roomsCount" in p
-        ]
+        items = json.loads(m.group(1))
+        result = []
+        for item in items:
+            pool = item.get("pool")
+            if not isinstance(pool, dict) or "roomsCount" not in pool:
+                continue
+            result.append({
+                "rooms_count": pool["roomsCount"],
+                "available":   item.get("freeApartmentsCount", 0),
+                "min_area":    pool.get("minArea"),
+                "max_area":    pool.get("maxArea"),
+                "price_sqm":   int(pool["oneAreaCost"]) if pool.get("oneAreaCost") else None,
+                "status":      item.get("statusModel", {}).get("code"),
+            })
+        return result
     except Exception as e:
         logger.warning("fetch_room_data(%s): %s", url, e)
         return []
