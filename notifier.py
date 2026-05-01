@@ -56,8 +56,62 @@ def _card_message(card: dict, header: str = "🏠 <b>Новый объект н�
         lines.append(f"📅 Опубликовано: {card['publish_date'][:10]}")
     if card.get("code"):
         lines.append(f"🔑 Код объекта: {html.escape(str(card['code']))}")
+    rooms_block = _rooms_block(card.get("rooms", []))
+    if rooms_block:
+        lines.append("")
+        lines.append(rooms_block)
     if card.get("url"):
         lines.append(f'🔗 <a href="{html.escape(card["url"])}">Открыть на Baspana</a>')
+    return "\n".join(lines)
+
+
+_ROOM_LABELS = {0: "Студия", 1: "1-комн", 2: "2-комн", 3: "3-комн", 4: "4-комн"}
+
+
+def _room_label(rooms_count: int) -> str:
+    return _ROOM_LABELS.get(rooms_count, f"{rooms_count}-комн")
+
+
+def _rooms_block(rooms: list[dict]) -> str:
+    """Блок разбивки по комнатам для нового объекта."""
+    if not rooms:
+        return ""
+    lines = ["🛏 <b>По комнатам:</b>"]
+    for room in sorted(rooms, key=lambda r: r["rooms_count"]):
+        label = _room_label(room["rooms_count"])
+        n     = room["available"]
+        mn, mx = room.get("min_area"), room.get("max_area")
+        area  = ""
+        if mn is not None and mx is not None:
+            area = f" · {mn:.0f}" + (f"–{mx:.0f}" if mx != mn else "") + " м²"
+        price = ""
+        if room.get("price_sqm"):
+            price = " · " + f"{room['price_sqm']:,}".replace(",", " ") + " ₸/м²"
+        lines.append(f"  {label}: <b>{n}</b>{area}{price}")
+    return "\n".join(lines)
+
+
+def _room_diffs_block(room_diffs: list[dict]) -> str:
+    """Блок изменений по комнатам для changed-уведомления.
+
+    Показывает все типы комнат; изменившиеся выделены иконкой.
+    """
+    if not room_diffs or not any(d["changed"] for d in room_diffs):
+        return ""
+    lines = ["🛏 <b>По комнатам:</b>"]
+    for d in sorted(room_diffs, key=lambda r: r["rooms_count"]):
+        label = _room_label(d["rooms_count"])
+        old, new = d["old"], d["new"]
+        if d["changed"]:
+            if old is None:
+                lines.append(f"  {label}: <b>{new}</b> (новый тип) ✅")
+            else:
+                delta = new - old
+                sign  = "+" if delta > 0 else ""
+                icon  = "✅" if delta > 0 else "📉"
+                lines.append(f"  {label}: {old} → <b>{new}</b> ({sign}{delta}) {icon}")
+        else:
+            lines.append(f"  {label}: {new} (без изм.)")
     return "\n".join(lines)
 
 
@@ -87,6 +141,10 @@ def _changed_message(card: dict) -> str:
         lines.append(f"  {label}: {old} → <b>{new}</b> ({sign}{delta})")
     if card.get("program"):
         lines.append(f"\n📋 {html.escape(card['program'])}")
+    room_diffs_block = _room_diffs_block(card.get("room_diffs", []))
+    if room_diffs_block:
+        lines.append("")
+        lines.append(room_diffs_block)
     if card.get("url"):
         lines.append(f'🔗 <a href="{html.escape(card["url"])}">Открыть на Baspana</a>')
     return "\n".join(lines)

@@ -13,6 +13,8 @@ BASE        = "https://baspana.otbasybank.kz"
 SEARCH_URL  = f"{BASE}/pool/search"
 OBJECTS_URL = f"{BASE}/Pool/GetObjects"
 
+_ROOM_MODEL_RE = re.compile(r"const\s+model\s*=\s*(\[.*?\]);", re.DOTALL)
+
 
 def _make_session() -> requests.Session:
     s = requests.Session()
@@ -138,6 +140,39 @@ def _fetch_with_retry(session: requests.Session, csrf: str | None,
                            region_name, attempt, attempts, page_num, e, delay)
             time.sleep(delay)
             delay *= 2
+
+
+def fetch_room_data(url: str, session: requests.Session) -> list[dict]:
+    """Получить данные по комнатам из детальной страницы объекта.
+
+    Парсит `const model = [...]` из HTML и возвращает список:
+      [{"rooms_count": 1, "available": 2, "min_area": 40.0, "max_area": 40.1,
+        "price_sqm": 280000, "status": "ACTUAL"}, ...]
+    При ошибке возвращает [].
+    """
+    try:
+        resp = session.get(url, timeout=20)
+        resp.raise_for_status()
+        m = _ROOM_MODEL_RE.search(resp.text)
+        if not m:
+            logger.debug("fetch_room_data: const model не найден (%s)", url)
+            return []
+        pools = json.loads(m.group(1))
+        return [
+            {
+                "rooms_count": p["roomsCount"],
+                "available":   p.get("freeApartmentsCount", 0),
+                "min_area":    p.get("minArea"),
+                "max_area":    p.get("maxArea"),
+                "price_sqm":   int(p["oneAreaCost"]) if p.get("oneAreaCost") else None,
+                "status":      p.get("statusModel", {}).get("code"),
+            }
+            for p in pools
+            if isinstance(p, dict) and "roomsCount" in p
+        ]
+    except Exception as e:
+        logger.warning("fetch_room_data(%s): %s", url, e)
+        return []
 
 
 def make_session() -> requests.Session:

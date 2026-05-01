@@ -10,6 +10,53 @@ logger = logging.getLogger(__name__)
 _TRACKED_FIELDS = ["available", "rough", "improved_rough", "pre_finish", "finish"]
 
 
+def _compute_room_diffs(prev_rooms: list[dict], curr_rooms: list[dict]) -> list[dict]:
+    """Сравнить снимки по комнатам. Возвращает список по всем типам комнат.
+
+    Поля: rooms_count, old (None если новый тип), new, min_area, max_area,
+          price_sqm, changed (bool).
+    """
+    prev_map = {r["rooms_count"]: r for r in (prev_rooms or [])}
+    result = []
+    for curr in sorted(curr_rooms, key=lambda r: r["rooms_count"]):
+        prev = prev_map.get(curr["rooms_count"])
+        old_avail = prev["available"] if prev else None
+        result.append({
+            "rooms_count": curr["rooms_count"],
+            "old":         old_avail,
+            "new":         curr["available"],
+            "min_area":    curr.get("min_area"),
+            "max_area":    curr.get("max_area"),
+            "price_sqm":   curr.get("price_sqm"),
+            "changed":     old_avail != curr["available"],
+        })
+    return result
+
+
+def _enrich_with_rooms(listings: list[dict], session) -> None:
+    """Для каждого листинга сделать запрос к детальной странице,
+    сохранить снимок комнат (autocommit=False) и прикрепить к dict:
+      listing["rooms"]      — текущие данные по комнатам
+      listing["room_diffs"] — сравнение с предыдущим снимком
+    """
+    for listing in listings:
+        url = listing.get("url")
+        if not url:
+            continue
+        try:
+            rooms = crawler.fetch_room_data(url, session)
+            if not rooms:
+                continue
+            prev_rooms = storage.get_latest_room_snapshot(listing["id"])
+            room_diffs = _compute_room_diffs(prev_rooms, rooms)
+            storage.save_room_snapshot(listing["id"], rooms, autocommit=False)
+            listing["rooms"]      = rooms
+            listing["room_diffs"] = room_diffs
+        except Exception as e:
+            logger.warning("[rooms] %s: %s", listing.get("id"), e)
+        time.sleep(0.2)
+
+
 def _find_diffs(prev: dict, current: dict) -> dict:
     diffs = {}
     for field in _TRACKED_FIELDS:
@@ -56,6 +103,10 @@ def run_region(region_guid: str, region_name: str,
                     storage.save_snapshot(listing["id"], listing, autocommit=False)
                     changed_objects.append(listing)
                     logger.info("[%s] Изменение [%s]: %s", region_name, listing["id"], diffs)
+
+        # Обогатить данными по комнатам до постановки в очередь
+        if session is not None and (new_objects or changed_objects):
+            _enrich_with_rooms(new_objects + changed_objects, session)
 
         if new_objects:
             storage.enqueue_notification(region_guid, "new", new_objects, autocommit=False)

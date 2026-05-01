@@ -47,11 +47,14 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS subscriptions (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     INTEGER NOT NULL REFERENCES users(user_id),
-            region_guid TEXT NOT NULL,
-            paid_until  TEXT NOT NULL,
-            created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id          INTEGER NOT NULL REFERENCES users(user_id),
+            region_guid      TEXT NOT NULL,
+            paid_until       TEXT NOT NULL,
+            created_at       TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            cancelled_at     TEXT,
+            weekly_signal_at TEXT,
+            notify_mode      TEXT DEFAULT 'positive',
             UNIQUE(user_id, region_guid)
         );
 
@@ -109,6 +112,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             stars_amount        INTEGER NOT NULL,
             telegram_charge_id  TEXT,
             invoice_payload     TEXT,
+            promo_code          TEXT,
             paid_at             TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
         );
 
@@ -163,6 +167,21 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             payload    TEXT    NOT NULL DEFAULT '{}',
             updated_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
         );
+
+        CREATE TABLE IF NOT EXISTS object_room_snapshots (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            inner_code  TEXT NOT NULL REFERENCES objects(inner_code) ON DELETE CASCADE,
+            rooms_count INTEGER NOT NULL,
+            available   INTEGER NOT NULL,
+            min_area    REAL,
+            max_area    REAL,
+            price_sqm   INTEGER,
+            status      TEXT,
+            crawled_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_room_snapshots
+            ON object_room_snapshots(inner_code, crawled_at DESC);
     """)
     conn.commit()
 
@@ -814,15 +833,58 @@ def get_price_trends(region_guid: str) -> dict[str, dict]:
     return result
 
 
+def save_room_snapshot(inner_code: str, rooms: list[dict], *, autocommit: bool = True) -> None:
+    """Сохранить снимок данных по комнатам для объекта."""
+    for room in rooms:
+        _db().execute(
+            """INSERT INTO object_room_snapshots
+               (inner_code, rooms_count, available, min_area, max_area, price_sqm, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (inner_code, room["rooms_count"], room["available"],
+             room.get("min_area"), room.get("max_area"),
+             room.get("price_sqm"), room.get("status")),
+        )
+    if autocommit:
+        _db().commit()
+
+
+def get_latest_room_snapshot(inner_code: str) -> list[dict]:
+    """Последний снимок по комнатам для объекта, отсортированный по rooms_count."""
+    rows = _db().execute(
+        """WITH latest AS (
+               SELECT MAX(crawled_at) AS max_at
+               FROM object_room_snapshots WHERE inner_code = ?
+           )
+           SELECT s.rooms_count, s.available, s.min_area, s.max_area, s.price_sqm, s.status
+           FROM object_room_snapshots s, latest
+           WHERE s.inner_code = ? AND s.crawled_at = latest.max_at
+           ORDER BY s.rooms_count""",
+        (inner_code, inner_code),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_all_objects_with_url() -> list[dict]:
+    """Все объекты с заполненным url — для однократного сканирования комнат."""
+    rows = _db().execute(
+        "SELECT inner_code, name, url FROM objects WHERE url IS NOT NULL AND url != ''"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def cleanup_old_snapshots(days: int = 90) -> int:
     """Удалить снимки старше days дней. Возвращает количество удалённых строк."""
     cur = _db().execute(
         f"DELETE FROM object_snapshots WHERE timestamp < datetime('now', '-{days} days')"
     )
+    cur2 = _db().execute(
+        f"DELETE FROM object_room_snapshots WHERE crawled_at < datetime('now', '-{days} days')"
+    )
     _db().commit()
-    deleted = cur.rowcount
+    deleted = cur.rowcount + cur2.rowcount
     if deleted:
-        logger.info("Очистка снимков: удалено %d строк старше %d дней", deleted, days)
+        logger.info("Очистка снимков: удалено %d строк старше %d дней (%d комнат)",
+                    deleted, days, cur2.rowcount)
     return deleted
 
 
