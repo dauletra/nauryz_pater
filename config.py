@@ -23,11 +23,18 @@ OBJECT_STATUS      = 1
 OBJECT_STATUS_NAME = "Прием заявлений"
 
 
-def validate() -> None:
-    """Проверить обязательные переменные окружения. Вызывать при старте."""
+def validate(*, require_webhook: bool = True) -> None:
+    """Проверить обязательные переменные окружения. Вызывать при старте.
+
+    Args:
+        require_webhook: если True (по умолчанию), требовать WEBHOOK_SECRET —
+            это нужно боту, который принимает webhook'и от Telegram. Cron-скрипты
+            (run_crawler.py, run_notifier.py, run_daily.py) делают только исходящие
+            запросы — им WEBHOOK_SECRET не нужен, передавайте False.
+    """
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN не задан в .env")
-    if not WEBHOOK_SECRET:
+    if require_webhook and not WEBHOOK_SECRET:
         raise RuntimeError("WEBHOOK_SECRET не задан в .env")
     if not ADMIN_USER_ID:
         import logging

@@ -137,11 +137,51 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
             sent_at      TEXT,
             status       TEXT    NOT NULL DEFAULT 'pending'
-                CHECK(status IN ('pending', 'sent', 'failed'))
+                CHECK(status IN ('pending', 'sent', 'failed')),
+            attempts     INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE INDEX IF NOT EXISTS idx_nqueue_status
             ON notification_queue(status, created_at);
+
+        -- Per-recipient delivery tracking. Без этого при частичном сбое
+        -- (1 из 100 fail → весь event фейлится → ретрай всем 100) пользователи
+        -- получали бы дубли. Здесь храним: кому уже доставили, кому ещё нет.
+        CREATE TABLE IF NOT EXISTS notification_recipients (
+            notification_id INTEGER NOT NULL
+                REFERENCES notification_queue(id) ON DELETE CASCADE,
+            user_id         INTEGER NOT NULL,
+            sent_at         TEXT,           -- NULL = попытка была, но не доставлено
+            PRIMARY KEY (notification_id, user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_nrecipients_pending
+            ON notification_recipients(notification_id, sent_at);
+
+        -- Broadcast queue: рассылки админа теперь не в daemon thread,
+        -- а через персистентную БД-очередь. Переживает рестарт бота.
+        CREATE TABLE IF NOT EXISTS broadcast_jobs (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            text         TEXT    NOT NULL,
+            parse_mode   TEXT    NOT NULL DEFAULT 'HTML',
+            status       TEXT    NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending', 'running', 'done')),
+            created_by   INTEGER,
+            created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            finished_at  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_broadcast_jobs_pending
+            ON broadcast_jobs(status, id);
+
+        CREATE TABLE IF NOT EXISTS broadcast_recipients (
+            job_id   INTEGER NOT NULL REFERENCES broadcast_jobs(id) ON DELETE CASCADE,
+            user_id  INTEGER NOT NULL,
+            status   TEXT    NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending', 'sent', 'failed')),
+            sent_at  TEXT,
+            PRIMARY KEY (job_id, user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_pending
+            ON broadcast_recipients(job_id, status);
 
         CREATE TABLE IF NOT EXISTS promo_codes (
             code         TEXT PRIMARY KEY,
@@ -256,6 +296,66 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE payments ADD COLUMN promo_code TEXT")
         conn.commit()
         logger.info("Миграция: добавлена колонка payments.promo_code")
+
+    # Миграция 6: notification_queue.attempts (счётчик retry, dead-letter после MAX)
+    nq_cols = {row[1] for row in conn.execute("PRAGMA table_info(notification_queue)").fetchall()}
+    if "attempts" not in nq_cols:
+        conn.execute(
+            "ALTER TABLE notification_queue ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
+        logger.info("Миграция: добавлена колонка notification_queue.attempts")
+
+    # Миграция 7: per-recipient delivery tracking (избавление от дублей при retry)
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    if "notification_recipients" not in tables:
+        conn.executescript("""
+            CREATE TABLE notification_recipients (
+                notification_id INTEGER NOT NULL
+                    REFERENCES notification_queue(id) ON DELETE CASCADE,
+                user_id         INTEGER NOT NULL,
+                sent_at         TEXT,
+                PRIMARY KEY (notification_id, user_id)
+            );
+            CREATE INDEX idx_nrecipients_pending
+                ON notification_recipients(notification_id, sent_at);
+        """)
+        conn.commit()
+        logger.info("Миграция: добавлена таблица notification_recipients")
+
+    # Миграция 8: broadcast queue (рассылки админа без daemon thread'ов)
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    if "broadcast_jobs" not in tables:
+        conn.executescript("""
+            CREATE TABLE broadcast_jobs (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                text         TEXT    NOT NULL,
+                parse_mode   TEXT    NOT NULL DEFAULT 'HTML',
+                status       TEXT    NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'running', 'done')),
+                created_by   INTEGER,
+                created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                finished_at  TEXT
+            );
+            CREATE INDEX idx_broadcast_jobs_pending ON broadcast_jobs(status, id);
+
+            CREATE TABLE broadcast_recipients (
+                job_id   INTEGER NOT NULL REFERENCES broadcast_jobs(id) ON DELETE CASCADE,
+                user_id  INTEGER NOT NULL,
+                status   TEXT    NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'sent', 'failed')),
+                sent_at  TEXT,
+                PRIMARY KEY (job_id, user_id)
+            );
+            CREATE INDEX idx_broadcast_recipients_pending
+                ON broadcast_recipients(job_id, status);
+        """)
+        conn.commit()
+        logger.info("Миграция: добавлены таблицы broadcast_jobs, broadcast_recipients")
 
 
 # ---------------------------------------------------------------------------
@@ -1040,6 +1140,13 @@ def get_daily_history(days: int = 30) -> list[dict]:
 # Notification queue
 # ---------------------------------------------------------------------------
 
+#: После стольких безуспешных попыток событие перестаёт ретраиться
+#: (остаётся в БД со status='failed' и attempts >= лимита — dead-letter
+#: для диагностики). Защищает от бесконечного спама при систематическом
+#: сбое (заблокированный пользователь, битый payload, баг в notifier).
+MAX_NOTIFICATION_ATTEMPTS = 5
+
+
 def enqueue_notification(
     region_guid: str,
     event_type: str,
@@ -1056,14 +1163,20 @@ def enqueue_notification(
 
 
 def get_pending_notifications(limit: int = 100) -> list[dict]:
-    """Return pending + failed events ordered by id (FIFO). Failed rows are retried."""
+    """Return pending + failed events ordered by id (FIFO).
+
+    Failed rows are retried, но только до MAX_NOTIFICATION_ATTEMPTS попыток —
+    после этого строка остаётся в БД для диагностики, но больше не подхватывается
+    нотификатором (dead-letter).
+    """
     rows = _db().execute(
-        """SELECT id, region_guid, event_type, payload_json, created_at
+        """SELECT id, region_guid, event_type, payload_json, created_at, attempts
            FROM notification_queue
            WHERE status IN ('pending', 'failed')
+             AND attempts < ?
            ORDER BY id
            LIMIT ?""",
-        (limit,),
+        (MAX_NOTIFICATION_ATTEMPTS, limit),
     ).fetchall()
     result = []
     for row in rows:
@@ -1083,12 +1196,202 @@ def mark_notification_sent(notification_id: int) -> None:
     _db().commit()
 
 
-def mark_notification_failed(notification_id: int) -> None:
+# ─── Per-recipient delivery tracking ────────────────────────────────────────
+# Цель: при ретрае не отправлять повторно тем, кому уже доставили. Это
+# критично для notification_queue, иначе при сбое 1-го из 100 подписчиков
+# остальные 99 получат дубль на следующем тике.
+
+def is_recipient_delivered(notification_id: int, user_id: int) -> bool:
+    """True если пользователю уже успешно доставили это событие."""
+    row = _db().execute(
+        """SELECT sent_at FROM notification_recipients
+           WHERE notification_id = ? AND user_id = ?""",
+        (notification_id, user_id),
+    ).fetchone()
+    return bool(row and row["sent_at"])
+
+
+def mark_recipient_delivered(notification_id: int, user_id: int) -> None:
+    """Зафиксировать успешную доставку (UPSERT — может быть запись с sent_at=NULL)."""
     _db().execute(
-        "UPDATE notification_queue SET status = 'failed' WHERE id = ?",
-        (notification_id,),
+        """INSERT INTO notification_recipients (notification_id, user_id, sent_at)
+           VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+           ON CONFLICT(notification_id, user_id)
+           DO UPDATE SET sent_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')""",
+        (notification_id, user_id),
     )
     _db().commit()
+
+
+def mark_recipient_attempted(notification_id: int, user_id: int) -> None:
+    """Зафиксировать попытку доставки без успеха (sent_at остаётся NULL).
+
+    Нужно чтобы при следующем ретрае мы видели «попытка была, доставки нет»
+    и могли её отделить от «вообще не пытались». Сейчас обе ситуации обработаны
+    одинаково (повторим), но различение пригодится для админской аналитики.
+    """
+    _db().execute(
+        """INSERT OR IGNORE INTO notification_recipients (notification_id, user_id)
+           VALUES (?, ?)""",
+        (notification_id, user_id),
+    )
+    _db().commit()
+
+
+def count_delivered_recipients(notification_id: int) -> int:
+    """Сколько подписчиков уже получили это событие."""
+    row = _db().execute(
+        """SELECT COUNT(*) AS n FROM notification_recipients
+           WHERE notification_id = ? AND sent_at IS NOT NULL""",
+        (notification_id,),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def mark_notification_failed(notification_id: int) -> int:
+    """Инкрементировать attempts и пометить событие как failed.
+
+    Возвращает новое значение attempts. Когда attempts достигает
+    MAX_NOTIFICATION_ATTEMPTS, событие становится dead-letter — больше
+    не подхватывается get_pending_notifications, но строка остаётся
+    в БД для админской диагностики.
+    """
+    _db().execute(
+        """UPDATE notification_queue
+           SET status = 'failed', attempts = attempts + 1
+           WHERE id = ?""",
+        (notification_id,),
+    )
+    row = _db().execute(
+        "SELECT attempts FROM notification_queue WHERE id = ?",
+        (notification_id,),
+    ).fetchone()
+    _db().commit()
+    return int(row["attempts"]) if row else 0
+
+
+def count_dead_notifications() -> int:
+    """Сколько событий перестали ретраиться из-за исчерпания попыток."""
+    row = _db().execute(
+        """SELECT COUNT(*) AS n FROM notification_queue
+           WHERE status = 'failed' AND attempts >= ?""",
+        (MAX_NOTIFICATION_ATTEMPTS,),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+# ─── Broadcast queue ───────────────────────────────────────────────────────
+
+def enqueue_broadcast(text: str, recipient_user_ids: list[int],
+                      *, parse_mode: str = "HTML",
+                      created_by: int | None = None) -> int:
+    """Создать broadcast job и заполнить recipients. Возвращает id job'а.
+
+    Транзакционно: либо создаются и job, и все recipients, либо ничего.
+    """
+    db = _db()
+    db.execute("BEGIN")
+    try:
+        cur = db.execute(
+            """INSERT INTO broadcast_jobs (text, parse_mode, created_by)
+               VALUES (?, ?, ?)""",
+            (text, parse_mode, created_by),
+        )
+        job_id = cur.lastrowid
+        if recipient_user_ids:
+            db.executemany(
+                "INSERT OR IGNORE INTO broadcast_recipients (job_id, user_id) VALUES (?, ?)",
+                [(job_id, uid) for uid in recipient_user_ids],
+            )
+        db.commit()
+        return job_id
+    except Exception:
+        db.rollback()
+        raise
+
+
+def get_next_pending_broadcast() -> dict | None:
+    """Вернуть первый pending или running job (FIFO).
+
+    Running берём тоже — это значит предыдущий запуск воркера упал на полпути,
+    и надо доделать. Все доставленные recipients уже помечены sent — повторов не будет.
+    """
+    row = _db().execute(
+        """SELECT id, text, parse_mode, status, created_by, created_at
+           FROM broadcast_jobs
+           WHERE status IN ('pending', 'running')
+           ORDER BY id
+           LIMIT 1"""
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_pending_broadcast_recipients(job_id: int, limit: int = 10000) -> list[int]:
+    """Список user_id, которым ещё не отправили (status='pending')."""
+    rows = _db().execute(
+        """SELECT user_id FROM broadcast_recipients
+           WHERE job_id = ? AND status = 'pending'
+           ORDER BY user_id
+           LIMIT ?""",
+        (job_id, limit),
+    ).fetchall()
+    return [r["user_id"] for r in rows]
+
+
+def mark_broadcast_running(job_id: int) -> None:
+    _db().execute(
+        "UPDATE broadcast_jobs SET status='running' WHERE id = ? AND status='pending'",
+        (job_id,),
+    )
+    _db().commit()
+
+
+def mark_broadcast_recipient(job_id: int, user_id: int, success: bool) -> None:
+    """Отметить попытку для одного пользователя."""
+    _db().execute(
+        """UPDATE broadcast_recipients
+           SET status = ?,
+               sent_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+           WHERE job_id = ? AND user_id = ?""",
+        ("sent" if success else "failed", job_id, user_id),
+    )
+    _db().commit()
+
+
+def finalize_broadcast_if_done(job_id: int) -> bool:
+    """Если pending recipients не осталось — пометить job 'done'. Вернуть True если так."""
+    row = _db().execute(
+        """SELECT COUNT(*) AS n FROM broadcast_recipients
+           WHERE job_id = ? AND status = 'pending'""",
+        (job_id,),
+    ).fetchone()
+    if row and row["n"] == 0:
+        _db().execute(
+            """UPDATE broadcast_jobs
+               SET status = 'done',
+                   finished_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+               WHERE id = ?""",
+            (job_id,),
+        )
+        _db().commit()
+        return True
+    return False
+
+
+def get_broadcast_stats(job_id: int) -> dict:
+    """Сводка: total, sent, failed, pending."""
+    row = _db().execute(
+        """SELECT
+              SUM(CASE WHEN status='sent'    THEN 1 ELSE 0 END) AS sent,
+              SUM(CASE WHEN status='failed'  THEN 1 ELSE 0 END) AS failed,
+              SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+              COUNT(*) AS total
+           FROM broadcast_recipients WHERE job_id = ?""",
+        (job_id,),
+    ).fetchone()
+    if not row:
+        return {"sent": 0, "failed": 0, "pending": 0, "total": 0}
+    return {k: int(row[k] or 0) for k in ("sent", "failed", "pending", "total")}
 
 
 def ping() -> bool:
@@ -1120,14 +1423,34 @@ def get_recently_expired_subscriptions(since_str: str, until_str: str) -> list[d
     return [dict(r) for r in rows]
 
 
-def cleanup_old_notifications(days: int = 7) -> int:
-    """Delete sent notification_queue rows older than `days` days."""
-    cur = _db().execute(
-        "DELETE FROM notification_queue WHERE status = 'sent' AND created_at < datetime('now', ?)",
+def cleanup_old_notifications(days: int = 7, dead_days: int = 30) -> int:
+    """Delete old notification_queue rows.
+
+    Args:
+        days: возраст для status='sent' (по умолчанию 7 дней — успешные).
+        dead_days: возраст для dead-letter (по умолчанию 30 дней — даём админу
+            время посмотреть на отказы перед удалением).
+
+    Чистим в две фазы, чтобы dead-letter (failed с исчерпанными attempts)
+    не копились вечно. Pending и failed-с-незавершёнными-attempts не трогаем —
+    они либо ждут отправки, либо ещё будут ретраиться.
+    """
+    cur_sent = _db().execute(
+        """DELETE FROM notification_queue
+           WHERE status = 'sent' AND created_at < datetime('now', ?)""",
         (f"-{days} days",),
     )
+    cur_dead = _db().execute(
+        """DELETE FROM notification_queue
+           WHERE status = 'failed' AND attempts >= ?
+             AND created_at < datetime('now', ?)""",
+        (MAX_NOTIFICATION_ATTEMPTS, f"-{dead_days} days"),
+    )
     _db().commit()
-    deleted = cur.rowcount
+    deleted = cur_sent.rowcount + cur_dead.rowcount
     if deleted:
-        logger.info("Очистка очереди уведомлений: удалено %d строк старше %d дней", deleted, days)
+        logger.info(
+            "Очистка очереди уведомлений: sent=%d (>%d дн.), dead=%d (>%d дн.)",
+            cur_sent.rowcount, days, cur_dead.rowcount, dead_days,
+        )
     return deleted

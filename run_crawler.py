@@ -7,6 +7,7 @@ Crontab (от пользователя otbasy):
 import logging
 import sys
 
+import config
 import crawler_lock
 import runner
 
@@ -18,6 +19,10 @@ logger = logging.getLogger(__name__)
 
 
 def main() -> None:
+    # Валидация .env при старте: ловит сломанный конфиг сразу, а не при первом
+    # tg.send_message через 10 минут. Webhook-секрет краулеру не нужен.
+    config.validate(require_webhook=False)
+
     lock = crawler_lock.acquire()
     if lock is None:
         logger.warning("Краулер уже запущен (lock занят), пропускаю запуск.")

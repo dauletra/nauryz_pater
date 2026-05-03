@@ -86,7 +86,36 @@ def _send_weekly_signals() -> None:
                          sub["user_id"], sub["region_guid"], e)
 
 
+def _alert_dead_letter_notifications() -> None:
+    """Если в очереди есть события, исчерпавшие retry — уведомить админа.
+
+    Dead-letter — это симптом систематической проблемы (баг в формате,
+    Telegram длительно недоступен, заблокированный бот у получателя).
+    Если ничего не делать, проблему заметим только по жалобе пользователя.
+    """
+    if not config.ADMIN_USER_ID:
+        return
+    dead = storage.count_dead_notifications()
+    if dead <= 0:
+        return
+    notifier.send_message(
+        f"⚠️ <b>Dead-letter в очереди уведомлений: {dead}</b>\n\n"
+        f"События, исчерпавшие {storage.MAX_NOTIFICATION_ATTEMPTS} попыток "
+        f"и больше не ретраятся.\n\n"
+        f"<code>SELECT id, region_guid, event_type, attempts, created_at\n"
+        f"FROM notification_queue\n"
+        f"WHERE status='failed' AND attempts >= {storage.MAX_NOTIFICATION_ATTEMPTS}\n"
+        f"ORDER BY id DESC LIMIT 20;</code>",
+        chat_id=str(config.ADMIN_USER_ID),
+    )
+    logger.warning("Алерт админу: dead-letter в очереди = %d", dead)
+
+
 def main() -> None:
+    # Валидация .env при старте: ловит сломанный конфиг сразу. Webhook-секрет
+    # этому скрипту не нужен — он только шлёт исходящие отчёты и напоминания.
+    config.validate(require_webhook=False)
+
     # Очистка старых снимков и давно истёкших подписок (история в payments не трогается)
     storage.cleanup_old_snapshots(days=90)
     storage.cleanup_expired_subscriptions(days=90)
@@ -100,6 +129,9 @@ def main() -> None:
             chat_id=str(config.ADMIN_USER_ID),
         )
         logger.info("Ежедневный отчёт отправлен: %s", stats)
+
+    # Алерт если есть dead-letter в очереди уведомлений
+    _alert_dead_letter_notifications()
 
     # Уведомить об истекающих подписках (за 7 дней и за 1 день)
     _notify_expiring_subscriptions()

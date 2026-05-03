@@ -462,21 +462,40 @@ def _handle_admin(user_id: int) -> None:
 
 
 def _handle_broadcast(user_id: int, text: str) -> None:
+    """Создать broadcast job в БД-очереди (без daemon thread).
+
+    Реальная отправка делается воркером в run_notifier.py каждые 10 минут.
+    Это переживает рестарт бота: раньше при `systemctl restart` посреди рассылки
+    половина пользователей не получала сообщение и узнать кто именно — было нельзя.
+    """
     if not text:
         _send(user_id, "Использование: /broadcast <текст>")
         return
+    if len(text) > 4000:
+        _send(user_id, f"❌ Текст слишком длинный ({len(text)} символов). "
+                       f"Лимит Telegram — 4096, оставьте запас на форматирование.")
+        return
+
     recipients = storage.get_all_active_user_ids()
-    _send(user_id, f"⏳ Рассылка {len(recipients)} пользователям...")
+    if not recipients:
+        _send(user_id, "❌ Нет активных подписчиков для рассылки.")
+        return
 
-    def _do_broadcast() -> None:
-        sent = 0
-        for uid in recipients:
-            if notifier.send_message(text, chat_id=str(uid)):
-                sent += 1
-            time.sleep(0.05)
-        _send(user_id, f"✅ Отправлено {sent} из {len(recipients)} пользователей.")
+    try:
+        job_id = storage.enqueue_broadcast(
+            text=text, recipient_user_ids=recipients,
+            parse_mode="HTML", created_by=user_id,
+        )
+    except Exception as e:
+        logger.error("Не удалось создать broadcast job: %s", e, exc_info=True)
+        _send(user_id, "❌ Ошибка при создании рассылки. Подробности в логах.")
+        return
 
-    threading.Thread(target=_do_broadcast, daemon=True).start()
+    _send(user_id,
+          f"📨 Рассылка #{job_id} поставлена в очередь.\n"
+          f"Получателей: <b>{len(recipients)}</b>\n\n"
+          f"Отправка пойдёт фоновым воркером (run_notifier, каждые 10 мин). "
+          f"При сбое продолжит с того места, где остановилась — никто не получит дубль.")
 
 
 def _handle_add_admin(actor_id: int, args: str) -> None:
@@ -1006,24 +1025,61 @@ def _handle_callback(callback_query: dict) -> None:
 # Payments (Telegram Stars)
 # ---------------------------------------------------------------------------
 
+def _parse_subscription_payload(payload: str) -> tuple[str, str | None, int | None] | None:
+    """Распарсить invoice_payload в (region_guid, promo_code, expected_stars).
+
+    Поддерживает два формата:
+        sub:{guid}                              → (guid, None, None)
+        sub:{guid}:promo:{code}:{stars}         → (guid, code, stars)
+
+    Возвращает None если payload невалиден (битый формат, неизвестный регион,
+    нечисловые stars). Все обращения к parts[N] защищены проверкой длины.
+    """
+    if not payload or not payload.startswith("sub:"):
+        return None
+    parts = payload.split(":")
+    if len(parts) < 2:
+        return None
+    region_guid = parts[1]
+    if not regions.is_valid_region(region_guid):
+        return None
+
+    if len(parts) == 2:
+        return (region_guid, None, None)
+
+    if len(parts) == 5 and parts[2] == "promo":
+        promo_code = parts[3]
+        try:
+            expected_stars = int(parts[4])
+        except ValueError:
+            return None
+        if not promo_code:
+            return None
+        return (region_guid, promo_code, expected_stars)
+
+    return None
+
+
 def _handle_pre_checkout(query: dict) -> None:
     amount  = query.get("total_amount", 0)
     payload = query.get("invoice_payload", "")
 
-    # Формат со скидкой: sub:{guid}:promo:{code}:{stars}
-    parts = payload.split(":")
-    if len(parts) == 5 and parts[2] == "promo":
-        try:
-            expected = int(parts[4])
-        except ValueError:
-            _answer_precheckout(query["id"], ok=False, error="Неверный формат счёта.")
-            return
-        if amount != expected:
-            logger.warning("pre_checkout promo: неверная сумма %d (ожидается %d)", amount, expected)
+    parsed = _parse_subscription_payload(payload)
+    if parsed is None:
+        logger.warning("pre_checkout: битый invoice_payload: %r", payload)
+        _answer_precheckout(query["id"], ok=False, error="Неверный формат счёта.")
+        return
+
+    _, promo_code, expected_stars = parsed
+    if promo_code is not None:
+        if amount != expected_stars:
+            logger.warning("pre_checkout promo: неверная сумма %d (ожидается %d)",
+                           amount, expected_stars)
             _answer_precheckout(query["id"], ok=False, error="Неверная сумма счёта.")
             return
     elif amount != config.STARS_PRICE:
-        logger.warning("pre_checkout: неверная сумма %d (ожидается %d)", amount, config.STARS_PRICE)
+        logger.warning("pre_checkout: неверная сумма %d (ожидается %d)",
+                       amount, config.STARS_PRICE)
         _answer_precheckout(
             query["id"], ok=False,
             error=f"Неверная сумма. Ожидается {config.STARS_PRICE} Stars.",
@@ -1034,14 +1090,15 @@ def _handle_pre_checkout(query: dict) -> None:
 
 def _handle_successful_payment(user_id: int, payment: dict) -> None:
     payload = payment.get("invoice_payload", "")
-    if not payload.startswith("sub:"):
-        logger.error("Неизвестный invoice_payload: %s", payload)
+    parsed  = _parse_subscription_payload(payload)
+    if parsed is None:
+        # Платёж принят Telegram'ом, но мы не понимаем payload — оплату
+        # уже не вернуть, поэтому громко логируем для ручного разбора.
+        logger.error("successful_payment: невалидный invoice_payload: %r (user=%d)",
+                     payload, user_id)
         return
 
-    # Парсим payload: sub:{guid} или sub:{guid}:promo:{code}:{stars}
-    parts       = payload.split(":")
-    region_guid = parts[1]
-    promo_code  = parts[3] if len(parts) == 5 and parts[2] == "promo" else None
+    region_guid, promo_code, _ = parsed
     region_name = regions.get_region_name(region_guid)
 
     charge_id = (payment.get("provider_payment_charge_id")

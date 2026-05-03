@@ -46,7 +46,10 @@
       "Bash(python -m py_compile storage.py notifier.py run_daily.py)",
       "Bash(python -m py_compile check.py)",
       "PowerShell(New-Item -ItemType Directory -Path \"C:\\\\Users\\\\Daulet-asus\\\\PycharmProjects\\\\OtbasyCrawler\\\\docs\" -Force)",
-      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\Daulet-asus\\\\PycharmProjects\\\\OtbasyCrawler\" -Force | Where-Object { $_.Name -notmatch '\\\\.venv|\\\\.idea' } | Select-Object Name, PSIsContainer | Format-Table -AutoSize)"
+      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\Daulet-asus\\\\PycharmProjects\\\\OtbasyCrawler\" -Force | Where-Object { $_.Name -notmatch '\\\\.venv|\\\\.idea' } | Select-Object Name, PSIsContainer | Format-Table -AutoSize)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('runner.py', encoding='utf-8'\\).read\\(\\)\\); print\\('runner.py syntax OK'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f, encoding='utf-8'\\).read\\(\\)\\) for f in ['storage.py', 'run_notifier.py']]; print\\('OK'\\)\")"
     ]
   }
 }

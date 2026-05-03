@@ -4,6 +4,7 @@ After=network.target
 
 [Service]
 User=otbasy
+Group=otbasy
 WorkingDirectory=/opt/otbasy/app
 EnvironmentFile=/opt/otbasy/app/.env
 ExecStart=/opt/otbasy/venv/bin/uvicorn bot:app --host 127.0.0.1 --port 8000
@@ -14,6 +15,40 @@ StartLimitBurst=5
 MemoryMax=256M
 StandardOutput=journal
 StandardError=journal
+
+# --- Security hardening ---
+# Запрещаем escalation привилегий (setuid/setgid/capabilities при exec)
+NoNewPrivileges=yes
+# /usr, /boot, /etc — read-only. /opt остаётся writable для crawler.lock,
+# data/, бэкапов. Для перехода на ProtectSystem=strict нужно перенести
+# crawler.lock в /opt/otbasy/data/ и добавить ReadWritePaths=/opt/otbasy/data.
+ProtectSystem=full
+# /home, /root, /run/user недоступны
+ProtectHome=yes
+# Изолированный /tmp на время работы юнита
+PrivateTmp=yes
+# Скрываем kernel-логи, sysctl, модули, cgroups — бот их не трогает
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# Разрешены только нужные сетевые семейства (TCP/IP + UNIX-сокеты)
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Отказываемся от всех linux capabilities — Python-приложение их не использует
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Запрещаем создание namespaces, realtime-приоритеты, новые setuid-биты
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+# Изолированный /dev (только базовые ноды)
+PrivateDevices=yes
+# Запрещаем personality(2) и нестандартные архитектуры syscall'ов
+LockPersonality=yes
+SystemCallArchitectures=native
+# Whitelist syscall'ов, исключая привилегированные и манипуляции с ресурсами
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
 
 [Install]
 WantedBy=multi-user.target

@@ -11,14 +11,28 @@ MAX_SINGLE_MESSAGES = 10
 
 
 def send_message(text: str, chat_id: str, parse_mode: str = "HTML") -> bool:
-    """Публичный метод для отправки произвольного сообщения (broadcast и др.)."""
-    return tg.send_message(chat_id, text, parse_mode=parse_mode)
+    """Публичный метод для отправки произвольного сообщения (broadcast и др.).
+
+    Возвращает True если Telegram принял сообщение. При неудаче пишет WARNING
+    в лог — без этого «у пользователя ничего не пришло» дебажится только по
+    жалобе. TelegramAPI уже логирует свои ошибки (status_code, description),
+    мы добавляем сюда контекст вызова (chat_id, длину текста).
+    """
+    ok = tg.send_message(chat_id, text, parse_mode=parse_mode)
+    if not ok:
+        logger.warning("notifier.send_message failed: chat=%s text_len=%d",
+                       chat_id, len(text))
+    return ok
 
 
 def _send_message(text: str, parse_mode: str = "HTML",
                   chat_id: str | None = None, **kwargs) -> bool:
     target = chat_id or config.TELEGRAM_CHAT_ID
-    return tg.send_message(target, text, parse_mode=parse_mode, **kwargs)
+    ok = tg.send_message(target, text, parse_mode=parse_mode, **kwargs)
+    if not ok:
+        logger.warning("notifier._send_message failed: chat=%s text_len=%d",
+                       target, len(text))
+    return ok
 
 
 def _finishing_line(card: dict) -> str:
