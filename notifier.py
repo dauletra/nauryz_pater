@@ -64,8 +64,6 @@ def _card_message(card: dict, header: str = "🏠 <b>Новый объект н�
         lines.append(f"🔧 {finishing}")
     if card.get("builder"):
         lines.append(f"👷 {html.escape(card['builder'])}")
-    if card.get("program"):
-        lines.append(f"📋 Программа: {html.escape(card['program'])}")
     if card.get("publish_date"):
         lines.append(f"📅 Опубликовано: {card['publish_date'][:10]}")
     if card.get("code"):
@@ -153,8 +151,6 @@ def _changed_message(card: dict) -> str:
         delta = new - old
         sign = "+" if delta > 0 else ""
         lines.append(f"  {label}: {old} → <b>{new}</b> ({sign}{delta})")
-    if card.get("program"):
-        lines.append(f"\n📋 {html.escape(card['program'])}")
     room_diffs_block = _room_diffs_block(card.get("room_diffs", []))
     if room_diffs_block:
         lines.append("")
