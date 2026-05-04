@@ -414,7 +414,10 @@ def set_admin(user_id: int, flag: bool = True) -> None:
 
 
 def get_all_users_count() -> int:
-    row = _db().execute("SELECT COUNT(*) AS cnt FROM users").fetchone()
+    """Все пользователи, кроме админов (для /admin аналитики)."""
+    row = _db().execute(
+        "SELECT COUNT(*) AS cnt FROM users WHERE COALESCE(is_admin, 0) = 0"
+    ).fetchone()
     return row["cnt"] if row else 0
 
 
@@ -562,12 +565,40 @@ def mark_weekly_signal_sent(user_id: int, region_guid: str) -> None:
     _db().commit()
 
 
-def get_active_subscriptions_count() -> int:
-    row = _db().execute(
+def get_active_subscriptions_count() -> dict:
+    """Активные подписки не-админов с разбивкой по платящим / 100%-промо.
+
+    free_promo: подписка, у которой ПОСЛЕДНИЙ платёж за пару (user_id, region_guid)
+                имел stars_amount = 0 (активирована через 100%-промокод).
+    paying:     total - free_promo (включая частичные скидки и полную цену).
+    """
+    total = _db().execute(
         """SELECT COUNT(*) AS cnt FROM subscriptions
-           WHERE paid_until > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"""
-    ).fetchone()
-    return row["cnt"] if row else 0
+           WHERE paid_until > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             AND user_id NOT IN (SELECT user_id FROM users WHERE is_admin = 1)"""
+    ).fetchone()["cnt"]
+
+    free_promo = _db().execute(
+        """WITH latest AS (
+               SELECT user_id, region_guid, MAX(paid_at) AS max_paid
+               FROM payments
+               GROUP BY user_id, region_guid
+           )
+           SELECT COUNT(*) AS cnt FROM subscriptions s
+           JOIN latest l   ON l.user_id = s.user_id AND l.region_guid = s.region_guid
+           JOIN payments p ON p.user_id = l.user_id
+                          AND p.region_guid = l.region_guid
+                          AND p.paid_at = l.max_paid
+           WHERE s.paid_until > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             AND s.user_id NOT IN (SELECT user_id FROM users WHERE is_admin = 1)
+             AND p.stars_amount = 0"""
+    ).fetchone()["cnt"]
+
+    return {
+        "total":      total,
+        "paying":     total - free_promo,
+        "free_promo": free_promo,
+    }
 
 
 def cleanup_expired_subscriptions(days: int = 90) -> int:
@@ -591,57 +622,74 @@ def cleanup_expired_subscriptions(days: int = 90) -> int:
 # ---------------------------------------------------------------------------
 
 def get_payment_stats() -> dict:
-    """Аналитика выручки и оттока для /admin."""
+    """Аналитика выручки и оттока для /admin.
+
+    Все агрегаты — только по платежам не-админов. Counts (today/month/total)
+    учитывают только платные транзакции (stars_amount > 0); 100%-промокоды
+    выделены в отдельное поле free_promo_30d. New/renewals/churn/retention
+    считаются только по платным платежам.
+    """
     row = _db().execute("""
         SELECT
             COALESCE(SUM(CASE WHEN paid_at >= date('now', 'start of day')
-                              THEN stars_amount END), 0)  AS today_stars,
+                              THEN stars_amount END), 0)         AS today_stars,
             COUNT(CASE WHEN paid_at >= date('now', 'start of day')
-                              THEN 1 END)                 AS today_count,
+                        AND stars_amount > 0
+                        THEN 1 END)                              AS today_count,
             COALESCE(SUM(CASE WHEN paid_at >= date('now', '-30 days')
-                              THEN stars_amount END), 0)  AS month_stars,
+                              THEN stars_amount END), 0)         AS month_stars,
             COUNT(CASE WHEN paid_at >= date('now', '-30 days')
-                              THEN 1 END)                 AS month_count,
-            COALESCE(SUM(stars_amount), 0)                AS total_stars,
-            COUNT(*)                                      AS total_count
+                        AND stars_amount > 0
+                        THEN 1 END)                              AS month_count,
+            COALESCE(SUM(stars_amount), 0)                       AS total_stars,
+            COUNT(CASE WHEN stars_amount > 0 THEN 1 END)         AS total_count
         FROM payments
+        WHERE user_id NOT IN (SELECT user_id FROM users WHERE is_admin = 1)
     """).fetchone()
 
-    # Новые подписчики за 30 дней — те, чья первая оплата была в этом периоде
+    # Новые подписчики за 30 дней — те, чья первая ПЛАТНАЯ оплата была в этом периоде
     new_users = _db().execute("""
         SELECT COUNT(*) AS cnt FROM (
             SELECT user_id FROM payments
+            WHERE user_id NOT IN (SELECT user_id FROM users WHERE is_admin = 1)
+              AND stars_amount > 0
             GROUP BY user_id
             HAVING MIN(paid_at) >= date('now', '-30 days')
         )
     """).fetchone()["cnt"]
 
-    # Продления за 30 дней — повторные оплаты пользователей с историей
+    # Продления — повторные платные оплаты у пользователей с историей платных
     renewals = _db().execute("""
-        SELECT COUNT(DISTINCT user_id) AS cnt FROM payments
-        WHERE paid_at >= date('now', '-30 days')
+        SELECT COUNT(DISTINCT user_id) AS cnt FROM payments p1
+        WHERE p1.user_id NOT IN (SELECT user_id FROM users WHERE is_admin = 1)
+          AND p1.paid_at >= date('now', '-30 days')
+          AND p1.stars_amount > 0
           AND EXISTS (
               SELECT 1 FROM payments p2
-              WHERE p2.user_id = payments.user_id
-                AND p2.paid_at < payments.paid_at
+              WHERE p2.user_id = p1.user_id
+                AND p2.paid_at < p1.paid_at
+                AND p2.stars_amount > 0
           )
     """).fetchone()["cnt"]
 
-    # Отток за 30 дней — пользователи, чья последняя оплата была 30–60 дней назад
-    # (подписка уже истекла, новой оплаты нет)
+    # Отток за 30 дней — пользователи, чья последняя ПЛАТНАЯ оплата была 30–60 дней назад
     churned = _db().execute("""
         SELECT COUNT(*) AS cnt FROM (
             SELECT user_id FROM payments
+            WHERE user_id NOT IN (SELECT user_id FROM users WHERE is_admin = 1)
+              AND stars_amount > 0
             GROUP BY user_id
             HAVING MAX(paid_at) >= date('now', '-60 days')
                AND MAX(paid_at) <  date('now', '-30 days')
         )
     """).fetchone()["cnt"]
 
-    # Удержание: из тех кто платил 30–60 дней назад, сколько продлили
+    # Удержание: из тех кто платил 30–60 дней назад, сколько продлили (тоже платно)
     retained = _db().execute("""
         SELECT COUNT(*) AS cnt FROM (
             SELECT user_id FROM payments
+            WHERE user_id NOT IN (SELECT user_id FROM users WHERE is_admin = 1)
+              AND stars_amount > 0
             GROUP BY user_id
             HAVING MAX(paid_at) >= date('now', '-60 days')
                AND MAX(paid_at) <  date('now', '-30 days')
@@ -651,6 +699,14 @@ def get_payment_stats() -> dict:
 
     base = churned + retained
     retention_pct = round(retained / base * 100) if base else None
+
+    # 100%-промо за 30 дней — distinct user_id, активировавшихся бесплатно
+    free_promo_30d = _db().execute("""
+        SELECT COUNT(DISTINCT user_id) AS cnt FROM payments
+        WHERE user_id NOT IN (SELECT user_id FROM users WHERE is_admin = 1)
+          AND stars_amount = 0
+          AND paid_at >= date('now', '-30 days')
+    """).fetchone()["cnt"]
 
     return {
         "today_stars":    row["today_stars"],
@@ -663,6 +719,7 @@ def get_payment_stats() -> dict:
         "renewals_30d":   renewals,
         "churned_30d":    churned,
         "retention_pct":  retention_pct,
+        "free_promo_30d": free_promo_30d,
     }
 
 def payment_exists(telegram_charge_id: str) -> bool:

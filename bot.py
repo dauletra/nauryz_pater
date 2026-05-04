@@ -428,7 +428,7 @@ def _handle_help(user_id: int) -> None:
 
 def _handle_admin(user_id: int) -> None:
     users_count = storage.get_all_users_count()
-    active_subs = storage.get_active_subscriptions_count()
+    subs        = storage.get_active_subscriptions_count()
     stats       = storage.get_daily_stats()
     pay         = storage.get_payment_stats()
 
@@ -437,10 +437,13 @@ def _handle_admin(user_id: int) -> None:
 
     _send(
         user_id,
-        f"⚙️ <b>Панель администратора</b>\n\n"
+        f"⚙️ <b>Панель администратора</b>\n"
+        f"<i>(админы исключены из всех счётчиков)</i>\n\n"
 
         f"👥 Пользователей: <b>{users_count}</b>\n"
-        f"📋 Активных подписок: <b>{active_subs}</b>\n\n"
+        f"📋 Активных подписок: <b>{subs['total']}</b>\n"
+        f"  💎 Платящих: <b>{subs['paying']}</b>\n"
+        f"  🎟 Через промо 100%: <b>{subs['free_promo']}</b>\n\n"
 
         f"💰 <b>Выручка (Stars):</b>\n"
         f"  Сегодня: <b>{pay['today_stars']}</b>  ({pay['today_count']} платежей)\n"
@@ -448,7 +451,8 @@ def _handle_admin(user_id: int) -> None:
         f"  Всего: <b>{pay['total_stars']}</b>  ({pay['total_count']} платежей)\n\n"
 
         f"📈 <b>Подписчики за 30 дней:</b>\n"
-        f"  🆕 Новых: <b>{pay['new_users_30d']}</b>\n"
+        f"  🆕 Новых платящих: <b>{pay['new_users_30d']}</b>\n"
+        f"  🎟 Через промо 100%: <b>{pay['free_promo_30d']}</b>\n"
         f"  🔄 Продлений: <b>{pay['renewals_30d']}</b>\n"
         f"  📉 Отток: <b>{pay['churned_30d']}</b>\n"
         f"  ✅ Удержание: <b>{retention_str}</b>\n\n"
