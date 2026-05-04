@@ -1154,7 +1154,15 @@ def _handle_promo_input(user_id: int, text: str) -> None:
     if not promo:
         # Возвращаем состояние ожидания, показываем ошибку
         storage.set_user_state(user_id, "promo_pending", pending)
-        _send(user_id, f'❌ Промокод <b>{html.escape(code)}</b> недействителен, исчерпан или уже использован.\n\nПопробуйте ещё раз или нажмите Отмена.')
+        _send(
+            user_id,
+            f'❌ Промокод <b>{html.escape(code)}</b> недействителен, '
+            f'исчерпан или уже использован.\n\n'
+            f'Попробуйте ещё раз или нажмите Отмена.',
+            reply_markup={"inline_keyboard": [
+                [{"text": "❌ Отмена", "callback_data": f"cancel_promo:{region_guid}"}],
+            ]},
+        )
         return
 
     discount_pct      = promo["discount_pct"]
@@ -1255,11 +1263,15 @@ def _handle_update(update: dict) -> None:
         if user_data and not user_data.get("is_admin"):
             storage.set_admin(user_id, True)
 
-    # Ввод промокода (перехватываем до любых команд)
+    # Ввод промокода — пропускаем slash-команды и reply-keyboard кнопки,
+    # чтобы пользователь мог выйти из ожидания через /start, /help и пр.
     _us = storage.get_user_state(user_id)
     if _us and _us["state"] == "promo_pending":
-        _handle_promo_input(user_id, text)
-        return
+        if text.startswith("/") or text in {"🏘 Квартиры", "📋 Мои подписки", "❓ Помощь"}:
+            storage.clear_user_state(user_id)
+        else:
+            _handle_promo_input(user_id, text)
+            return
 
     # Reply Keyboard кнопки
     if text == "🏘 Квартиры":
