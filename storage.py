@@ -894,7 +894,9 @@ def get_region_objects(region_guid: str) -> list[dict]:
            LEFT JOIN latest l ON l.inner_code = o.inner_code
            LEFT JOIN object_snapshots s ON s.id = l.max_id
            WHERE o.region_guid = ?
-           ORDER BY COALESCE(s.available, 0) DESC, o.name""",
+           ORDER BY COALESCE(s.available, 0) DESC,
+                    s.timestamp DESC,
+                    o.name""",
         (region_guid,),
     ).fetchall()
     return [dict(r) for r in rows]
