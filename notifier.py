@@ -143,6 +143,8 @@ def _changed_message(card: dict) -> str:
         lines.append(f"🏗 <b>{html.escape(card['name'])}</b>")
     if card.get("address"):
         lines.append(f"📍 {html.escape(card['address'])}")
+    if card.get("code"):
+        lines.append(f"🔑 Код объекта: {html.escape(str(card['code']))}")
     lines.append("")
     for field, label in _FIELD_LABELS.items():
         if field not in diffs:
